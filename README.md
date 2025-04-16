@@ -3,7 +3,7 @@ Autonomous Rust utility that load balances multiple https://ollama.com/ servers
 
 ![project logo small](./doc/logo/logo_small.png)
 
-Designed to be used with a reliable Ollama server- https://github.com/BigBIueWhale/llm_server_windows
+Designed to be used with (OpenWebUI)[https://github.com/BigBIueWhale/openwebui_config] or [continue.dev](https://www.continue.dev/)
 
 ## Release Notes
 
