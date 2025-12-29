@@ -53,10 +53,13 @@ https://github.com/BigBIueWhale/ollama_load_balancer/blob/RLS_01_00_00_2024_10_2
 
 ## Installation
 
+Download the [latest release](#release-notes) executable, or build from source:
 
-### Executable
+```sh
+cargo build --release
+```
 
-Download the [latest release](#release-notes) executable
+## Alternative Builds
 
 ### Nix (MacOS, Linux)
 
@@ -68,7 +71,7 @@ nix --extra-experimental-features "nix-command flakes" profile install "github:B
 
 ```
 docker build -t bigbluewhale/ollama_load_balancer .
-docker run -it --rm -p 11434 bigbluewhale/ollama_load_balancer --server="http://192.168.150.134:11434=james" --server="http://192.168.150.135:11434=sara"
+docker run -it --rm -p 11434:11434 bigbluewhale/ollama_load_balancer --server="http://192.168.150.134:11434=james" --server="http://192.168.150.135:11434=sara"
 ```
 
 ## Usage
