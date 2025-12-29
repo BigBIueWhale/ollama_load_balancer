@@ -216,6 +216,11 @@ These are the versions I used:
 - `rust-analyzer` v0.3.2146 by `The Rust Programming Language`
 
 ## Lab testing
+
+> **Note:** The VM-based setup described below is **only required to simulate production network topology** where multiple physical servers run Ollama on the same port (11434) with different IP addresses.
+>
+> This complexity exists because an OS typically restricts each subnet to a single network interface card. Virtual machines bypass this limitation by providing isolated network stacks with unique IP addresses.
+
 1. Use a Windows host with at least 64 gigabytes of RAM and at least 8 CPU cores so that you can run [three virtual machines at the same time](./doc/screenshots/virtual_machines_running_ollama.png).
 
 2. While the virtual machines are connected to the internet, install Ollama and run `ollama pull deepseek-coder:1.3b-instruct-q4_0`. Then kill Ollama from the Windows tray by right-clicking the tray icon. We choose this specific model because it has acceptable performance in CPU mode, and doesn't use much VRAM.
