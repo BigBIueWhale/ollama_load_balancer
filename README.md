@@ -553,6 +553,8 @@ C:\Users\user\Downloads>ollama_load_balancer.exe --server http://192.168.150.134
 - **Server capability tiers:** Fast servers, high-VRAM servers, and legacy servers all contributing to shared load balancing pool
 - **Dynamic configuration needs:** Ability to adjust KV cache settings per-model without manual server restarts
 
+![heterogenous concept](./doc/illustrations/heterogeneous_concept.png)
+
 ### Deployment Roadmap for 1.0.4
 
 **Infrastructure updates required across all servers:**
