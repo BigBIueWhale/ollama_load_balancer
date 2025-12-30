@@ -542,29 +542,147 @@ C:\Users\user\Downloads>ollama_load_balancer.exe --server http://192.168.150.134
 
 ## Future Plans
 
+### Vision for Version 1.0.4
+
+**The coming infrastructure reality:** Setting `OLLAMA_KEEP_ALIVE=-1` in [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows/blob/master/on_startup.ps1) dramatically improved Chat response speed by keeping models loaded in VRAM permanently. The availability of `gpt-oss:20b` (https://ollama.com/library/gpt-oss:20b, released August 5, 2025) offers 128k context capability—enabling queries over entire codebases. Looking ahead, we face a heterogeneous GPU landscape: new hardware with greater VRAM arriving alongside existing 24GB VRAM servers that still need to contribute. Use cases like agentic models for Claude Code will be possible but only on capable hardware. **The current load balancer infrastructure—treating all servers as identical and routing model-agnostically—is not prepared for this future.**
+
+**What's driving version 1.0.4:**
+- **Heterogeneous hardware:** Mix of 24GB VRAM servers (current deployment) and future higher-capacity GPUs
+- **Model diversity:** Small efficient models (gpt-oss:20b) coexist with large context-heavy models (qwen3-32b variants)
+- **Quality vs. capacity tradeoffs:** Some models tolerate KV cache quantization (qwen3-32b with q8_0 for 11k context), others demand full precision (gpt-oss:20b, gemma3 require q16 for quality)
+- **Server capability tiers:** Fast servers, high-VRAM servers, and legacy servers all contributing to shared load balancing pool
+- **Dynamic configuration needs:** Ability to adjust KV cache settings per-model without manual server restarts
+
+### Deployment Roadmap for 1.0.4
+
+**Infrastructure updates required across all servers:**
+
+1. **Update Ollama to latest version** on all AI servers. Ollama's initial implementation of `gpt-oss` (released August 5, 2025) had poor performance. The fixed implementation and updated model files (https://ollama.com/library/gpt-oss:20b) were released approximately two months later. All servers must run the corrected version.
+
+2. **Update [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows) to latest version** (December 29, 2025+). This version adds dynamic control over Ollama's global `KV_CACHE_TYPE` configuration via `GET :11435/health` (query current state) and `POST :11435/set-kv-cache` (change setting). Implementation involves process restart because Ollama does not support runtime reconfiguration of this parameter. All servers in the network must be updated.
+
+3. **Deploy new models** during server updates (changes require Ollama restart, so batch with llm_server_windows update):
+   - **Add:** `gpt-oss:20b` with `"think": "high"` mode (configured via Ollama Modelfile in `.ollama` directory, not runtime-changeable)
+   - **Add:** `qwen3-30b-a3b-thinking-2507` (updated Qwen3 variant with thinking capability)
+   - **Add:** `qwen3-30b-a3b-instruct-2507` (updated Qwen3 instruct variant)
+   - **Remove:** Old `qwen3-30b-a3b` models (superseded by 2507 versions)
+
+4. **Load balancer version 1.0.4 release:** Implement model-aware routing, capability tier system, KV cache coordination, and hot-model preference (detailed below).
+
 ### Model-Aware Load Balancing & KV Cache Optimization
 
-**What we have today:** The load balancer is a **path-agnostic HTTP proxy**. It copies the request path (e.g., `/api/chat`, `/api/tags`, `/api/ps`) and forwards the entire request to whichever server passes the availability check (`Reliable` + not `busy`). It has zero knowledge of what models exist on which servers, what's loaded in memory, or hardware capabilities. When a client queries `GET /api/tags` (list available models), the load balancer forwards it to essentially a random available server—the response only reflects that single server's model inventory. When a client requests inference with model X, the load balancer blindly routes to an available server that may not even have model X installed, resulting in connection failure and retry overhead.
+**What we have today (v1.0.3):** The load balancer is a **path-agnostic HTTP proxy**. It copies the request path (e.g., `/api/chat`, `/api/tags`, `/api/ps`) and forwards the entire request to whichever server passes the availability check (`Reliable` + not `busy`). It has zero knowledge of what models exist on which servers, what's loaded in memory, or hardware capabilities. When a client queries `GET /api/tags` (list available models), the load balancer forwards it to essentially a random available server—the response only reflects that single server's model inventory. When a client requests inference with model X, the load balancer blindly routes to an available server that may not even have model X installed, resulting in connection failure and retry overhead.
 
-**What we can achieve:** Transform the load balancer into a **model-aware orchestrator** that polls Ollama's APIs and [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows) control APIs to build comprehensive cluster state, then uses that state for intelligent routing and **direct response generation**:
+**What we will achieve in v1.0.4:** Transform the load balancer into a **model-aware orchestrator** that polls Ollama's APIs and [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows) control APIs to build comprehensive cluster state, then uses that state for intelligent routing and **direct response generation**:
 
-**Model Discovery & Aggregation (`GET /api/tags` on :11434):**
-Poll each server's `/api/tags` endpoint (returns installed models: name, size, digest) to build a cluster-wide model inventory. When a client queries `GET /api/tags`, the load balancer **responds directly** with the union of all models across all servers (or intersection—models available on at least one `Reliable` server), eliminating the random-server limitation. For inference requests (`/api/chat`, `/api/generate`), parse the `model` field from request JSON and route **only to servers that have that model installed**. Fail fast with meaningful errors ("model X not available on any server") instead of trial-and-error across incompatible servers. API present in Ollama v0.13.4+.
+#### Model Discovery & Aggregation (`GET /api/tags` on :11434)
+Poll each server's `/api/tags` endpoint (returns installed models: name, size, digest) to build a cluster-wide model inventory. When a client queries `GET /api/tags`, the load balancer **responds directly** with the union of all models across all servers (or intersection—models available on at least one `Reliable` server), eliminating the random-server limitation. For inference requests (`/api/chat`, `/api/generate`), parse the `model` field from request JSON and route **only to servers that have that model installed**. Fail fast with meaningful errors ("model X not available on any server") instead of trial-and-error across incompatible servers.
 
-**Hot Model Preference (`GET /api/ps` on :11434):**
-Poll each server's `/api/ps` endpoint (returns currently loaded models with VRAM usage, keep-alive status) to track which models are hot in memory. Among servers with the requested model, prefer servers where it's already loaded to eliminate cold-start latency (can be 5-60 seconds depending on model size and disk speed). Balance load intelligently when multiple models are in concurrent use—e.g., if 3 servers have both model A and B loaded, but 5 clients are using model A and 1 is using model B, route new model B requests to the least-busy model-B server. **Note:** [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows) uses `OLLAMA_KEEP_ALIVE=-1`, so models remain loaded permanently after first use (no cold starts after initial warmup). API present in Ollama v0.13.4+.
+#### Hot Model Preference (`GET /api/ps` on :11434)
+Poll each server's `/api/ps` endpoint (returns currently loaded models with VRAM usage, keep-alive status) to track which models are hot in memory. Among servers with the requested model, prefer servers where it's already loaded to eliminate cold-start latency (can be 5-60 seconds depending on model size and disk speed). Balance load intelligently when multiple models are in concurrent use—e.g., if 3 servers have both model A and B loaded, but 5 clients are using model A and 1 is using model B, route new model B requests to the least-busy model-B server.
 
-**Heterogeneous VRAM Tier Support:**
-Current limitation: The load balancer assumes homogeneous servers—all have identical models with identical configurations. This breaks down with mixed VRAM capacities. Example: Server A (24GB VRAM) runs `qwen3-32b` with q8_0 KV cache at 11k context. Server B (32GB VRAM) runs the same model with q16 KV cache at full 32k context. Users typically work around heterogeneous hardware by creating distinct model names via Ollama Modelfile (Server A: `qwen3-32b`, Server B: `qwen3-32b-long`), analogous to configuring `"think": "high"` or other parameters. OpenWebUI shows both as separate choices. **This bypass doesn't work with our load balancer today**—because it's path-agnostic and model-unaware, it routes `qwen3-32b-long` requests to any available server including Server A, which fails with OOM. We want to make this user-side bypass work because it's a good solution users already have at their disposal.
+**Immediate response capability:** When a model is already loaded in VRAM, inference begins immediately—users see the first token within milliseconds. This is critical for user experience. The load balancer should prefer servers with the requested model already hot, but only as a tiebreaker among servers of equal capability (see Server Selection Hierarchy below).
 
-**KV Cache Optimization ([llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows)):**
-Load balancer CLI will accept `--kv-q8` arguments listing model names that require 8-bit KV cache quantization (e.g., `--kv-q8 qwen3-32b --kv-q8 llama3:8b`). Models not in this list default to q16. Load balancer queries `GET :11435/health` to determine each server's current KV cache type (`{"kv_cache_type":"q8_0"}` or `"q16"`), then routes each model request only to servers with matching KV cache configuration—requests for `qwen3-32b` only go to q8_0 servers, requests for `qwen3-32b-long` only go to q16 servers. This enables the user-side bypass to work: lower-VRAM servers run models with q8_0 (50% VRAM of q16, faster, minimal quality loss), higher-VRAM servers run the same model with q16 (full precision, 2× VRAM, slower, maximum accuracy) under different names. Optionally support dynamic reconfiguration via `POST :11435/set-kv-cache` with `{"type":"q8_0"}` or `{"type":"q16"}` (returns 202, restart takes 5-15s). For backwards compatibility, if a server doesn't respond correctly to "health" endpoint, we should print very angry warning, but still allow it while essentially assuming that that server is running at 8-bit KV cache quantization. It's just that not all endpoints have installed the newest version of [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows).
+**Note:** [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows) uses `OLLAMA_KEEP_ALIVE=-1`, so models remain loaded permanently after first use (no cold starts after initial warmup).
+
+#### Heterogeneous VRAM & Server Capability Tiers
+Current limitation: The load balancer assumes homogeneous servers—all have identical models with identical configurations. This breaks down with mixed VRAM capacities and performance profiles.
+
+**Examples of heterogeneity:**
+- **VRAM capacity:** Server A (24GB VRAM) runs `qwen3-32b` with q8_0 KV cache at 11k context. Server B (32GB VRAM) runs the same model with q16 KV cache at full 32k context.
+- **Processing speed:** Server C has newer GPU generation, faster inference despite same VRAM.
+- **Model availability:** Server D has `gpt-oss:20b` + `qwen3-32b-think`, Server E only has `qwen3-32b-think`.
+
+Users typically work around heterogeneous hardware by creating distinct model names via Ollama Modelfile (Server A: `qwen3-32b`, Server B: `qwen3-32b-32k`), analogous to configuring `"think": "high"` or context length. OpenWebUI shows both as separate choices. **This bypass doesn't work with our load balancer today**—because it's path-agnostic and model-unaware, it routes `qwen3-32b-32k` requests to any available server including Server A, which fails with OOM. Version 1.0.4 makes this user-side bypass work by routing each model name only to servers that advertise it.
+
+**Capability tier system:** Load balancer CLI will accept per-server capability and speed annotations embedded in the server string (e.g., `--server "http://192.168.1.10:11434=Server-A[capability=10,speed=100]"`). Capability values range from 0-100 (inclusive) where 0 represents lowest capability and 100 represents highest capability. Speed values range from 0-100 (inclusive) where 0 represents baseline/normal speed and 100 represents maximum speed. Both parameters are optional; if not specified, they default to 0. Server selection prefers **lower-capability servers** for tasks they can handle (preserving high-capability servers for demanding workloads), with speed as final tiebreaker among equal-capability servers.
+
+#### KV Cache Optimization ([llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows))
+
+**Why KV cache matters:** The only reason we enabled q8_0 quantization on current 24GB VRAM servers is to achieve 11k context for `qwen3-32b` (q16 would OOM). However, this degrades quality for models that don't need quantization:
+- **Sensitive models:** `gemma3` is known to be extremely sensitive to KV cache quality—q8_0 significantly hurts performance even though it fits in VRAM
+- **Small models:** `gpt-oss:20b` is small enough to run with q16 even on 24GB VRAM, no reason to degrade it
+- **Unnecessarily degraded inference:** Applying q8_0 globally punishes models that could run at full quality
+
+**Solution:** Load balancer CLI will accept `--kv-q8` arguments listing model names that require 8-bit KV cache quantization (e.g., `--kv-q8 qwen3-32b --kv-q8 llama3:8b`). Models not in this list default to q16.
+
+Load balancer queries `GET :11435/health` to determine each server's current KV cache type (`{"kv_cache_type":"q8_0"}` or `"q16"`), then routes each model request only to servers with matching KV cache configuration:
+- Requests for `qwen3-32b` (requires q8_0 per CLI config) → only route to q8_0 servers
+- Requests for `gpt-oss:20b` (not in q8 list, defaults to q16) → only route to q16 servers
+- Requests for `qwen3-32b-32k` (user-created Modelfile variant, not in q8 list) → only route to q16 servers (implies high-VRAM server)
+
+This enables the user-side bypass to work: lower-VRAM servers run models with q8_0 (50% VRAM of q16, faster, minimal quality loss for tolerant models), higher-VRAM servers run the same or extended model with q16 (full precision, 2× VRAM used by KV-cache, slower, full context accuracy) under different names.
+
+**Dynamic reconfiguration (optional):** Support `POST :11435/set-kv-cache` with `{"type":"q8_0"}` or `{"type":"q16"}` (returns 202, restart takes 5-15s). This allows the load balancer to **automatically switch a server's KV cache mode** if the wrong-type servers are all busy but the right-type servers are available but misconfigured. However, this is a "nice-to-have" feature—the primary mechanism is pre-configured server pools.
+
+**Backwards compatibility:** If a server doesn't respond correctly to `GET :11435/health` endpoint, print a warning but still allow it while assuming that server is running at 8-bit KV cache quantization. Not all endpoints will have the newest version of [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows) immediately.
+
+#### Server Selection Hierarchy (v1.0.4)
+
+**All current functionality (v1.0.3) must remain:** The existing `Reliable`/`Unreliable`/`SecondChanceGiven` failure tracking logic is **critical and unchanged**. Runtime failures remain the authoritative signal for server health—a server reporting healthy via API but failing inference is still demoted to `Unreliable`. All described edge cases need to preserve their current behaviour which is proven and has been battle-tested.
+
+**New multi-stage selection logic for v1.0.4:**
+
+When a client requests inference with model X, the load balancer selects a server using this **sequential hierarchy** (each stage filters the candidate pool for the next stage):
+
+1. **Availability filter:** Only consider servers that are not `busy` (assumption: only this load balancer accesses Ollama servers, so we authoritatively track busy state)
+
+2. **Model availability filter:** From reliable available servers, only consider servers that have model X installed (per `/api/tags` polling). If no server has model X, that means that no server is available to serve request.
+
+3. **Reliability filter:** From available servers, prefer `Reliable` servers. Only fall back to `Unreliable` servers if no `Reliable` server is available (existing v1.0.3 behavior).
+
+4. **Capability tier preference:** From servers with model X, prefer the **lowest-capability tier** of available servers that can run model X. For example, if model X is available on servers with capability 10 and capability 80, route to the capability 10 tier (preserving capability 80 tier for models that require it). Capability values are embedded in the server string (e.g., `--server "http://192.168.1.10:11434=Server-A[capability=10]"`, `--server "http://192.168.1.11:11434=Server-B[capability=80]"`). Servers without explicit capability annotation default to capability 0 (lowest). This capability tier thing only affects choice of which server will be chosen to serve a model, out of the possible servers that actually support that model! `/api/tags` is still authoritative, but this is for a case where a high capability server supports a low-class model.
+
+5. **KV cache compatibility filter:** from the available low-capability tier that can run model X, prefer servers whose KV cache type (per `GET :11435/health`) currently matches the model's requirement (q8_0 if model is in `--kv-q8` list, q16 otherwise). If model X requires q8 but only q16 servers have it, optionally trigger dynamic reconfiguration- this **has** to be designed in a way that simulates the process of an Ollama server "ingesting the prompt". Meaning, the user's request has to connect (we have to simulate that while the server is restarting), but then the moment the server is up, we have to flood it with the kept request, and stream the result. This logic needs care. Especially in terms of how do we do this without blocking, and while perfectly respecting timeout, and quickly detecting that the server is up when it finally is up with the requested KV cache type. Also we need to support edge case of Ollama failing to come back up after restart because of power disconnect, and edge case of Ollama failing to start model after restart, because something else took over the VRAM. Essentially- this is a very tricky piece of logic here.
+
+6. **Hot model preference:** After applying considerations of capability tiers and "current KV cache configuration", prefer servers where model X is already loaded in VRAM (per `/api/ps` polling). This eliminates cold-start latency (5-60 seconds). If multiple servers have model X hot, proceed to next tiebreaker. If no servers have model X hot, choose any server from this tier (will incur cold-start). Obviously this consideration only applies when looking at servers that already had the correct `KV_CACHE_TYPE` when our load balancer first got this request.
+
+7. **Speed tiebreaker:** If multiple servers remain (same capability tier, model already loaded on all), prefer the **fastest server**. Speed values are embedded in the server string (e.g., `--server "http://192.168.1.10:11434=Server-A[speed=100]"`, `--server "http://192.168.1.12:11434=Server-C[speed=100]"`). Servers without explicit speed annotation default to speed 0 (baseline/normal). Higher speed values are preferred over lower speed values.
+
+8. **Fallback:** If multiple servers remain tied after all criteria, choose the first server in CLI argument order (deterministic).
+
+**Example scenario:**
+```
+CLI args:
+  --server "http://192.168.1.10:11434=ServerA[capability=10,speed=100]"
+  --server "http://192.168.1.11:11434=ServerB[capability=10]"
+  --server "http://192.168.1.12:11434=ServerC[capability=80,speed=100]"
+  --kv-q8 qwen3-32b
+
+Request: model=qwen3-32b
+1. Available: ServerA (not busy), ServerB (not busy), ServerC (busy) → [ServerA, ServerB]
+2. Reliable: All are Reliable → [ServerA, ServerB]
+3. Model installed: All have qwen3-32b → [ServerA, ServerB]
+4. KV cache: All are q8_0 (compatible) → [ServerA, ServerB]
+5. Capability: Prefer lowest tier (capability 10) → [ServerA, ServerB]
+6. Hot model: ServerA has qwen3-32b loaded, ServerB does not → [ServerA]
+7. Speed: Only one server remains → ServerA selected
+
+Request: model=gpt-oss:20b
+1. Available: ServerA (busy), ServerB (not busy), ServerC (not busy) → [ServerB, ServerC]
+2. Reliable: All are Reliable → [ServerB, ServerC]
+3. Model installed: Only ServerC has gpt-oss:20b → [ServerC]
+4. KV cache: ServerC is q16 (compatible, gpt-oss not in --kv-q8 list) → [ServerC]
+5. Capability: ServerC is capability 80 (only option) → [ServerC]
+→ ServerC selected (no choice, only ServerC has the model)
+```
 
 **Why runtime failure tracking remains critical:** Health check APIs (e.g., [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows) `GET :11435/health`) exist but are **not useful** for reliability assessment. A server can be network-reachable, report `{"status":"healthy"}`, and still fail every inference request due to insufficient VRAM (model loaded but KV cache allocation fails), corrupted model files (checksum passes but inference crashes), driver bugs (CUDA/ROCm errors mid-stream), or thermal throttling (starts OK, fails after 30 seconds). **The authoritative test is the result of actual inference.** The existing `Reliable`/`Unreliable`/`SecondChanceGiven` failure tracking logic (src/main.rs:244-254, 382-409) must remain the primary mechanism for server tier ranking. Model-aware routing operates **within the pool of `Reliable` servers**—it decides which `Reliable` server to route to based on model availability and load distribution, but runtime failures still demote servers to `Unreliable` regardless of what APIs report.
 
-**API Availability:** `/api/tags` and `/api/ps` present in Ollama v0.13.4+. OpenAI-compatible `GET /v1/models` added via [PR #5209](https://github.com/ollama/ollama/pull/5209) (merged July 2, 2024) and may also be leveraged for aggregation. [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows) control APIs (`GET :11435/health`, `POST :11435/set-kv-cache`) are custom to that deployment method. Exact version history for native Ollama APIs requires checking git history (no per-endpoint version tables published).
+#### API Availability
+- `/api/tags` and `/api/ps` present in Ollama since at least beginning of 2024.
+- OpenAI-compatible `GET /v1/models` added via [PR #5209](https://github.com/ollama/ollama/pull/5209) (merged July 2, 2024) and may also be leveraged for aggregation
+- [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows) control APIs (`GET :11435/health`, `POST :11435/set-kv-cache`) are custom to that deployment method (December 29, 2025+)
 
-**Implementation:** Background polling threads per server (30-60s intervals for `/api/tags` and `/api/ps`). Maintain in-memory cluster state: installed models per server, loaded models per server, KV cache type per server. Intercept `/api/tags` and `/v1/models` requests to respond directly with aggregated data instead of proxying. For inference requests (`/api/chat`, `/api/generate`, `/v1/chat/completions`), parse model name from request body and filter candidate servers before applying existing availability+reliability selection logic. Continue using runtime failure tracking as authoritative reliability signal.
+#### Implementation Notes
+- **Background polling threads** per server (30-60s intervals for `/api/tags` and `/api/ps`, 10-30s for `/health`)
+- **In-memory cluster state:** installed models per server, loaded models per server, KV cache type per server, capability tier per server, speed tier per server
+- **Intercept `GET /api/tags` and `GET /v1/models`:** Respond directly with aggregated data (union of all models across all servers) instead of proxying to random server
+- **Parse inference requests:** Extract `model` field from JSON body of `/api/chat`, `/api/generate`, `/v1/chat/completions` requests
+- **Filter candidates before selection:** Apply model availability + KV cache + capability + hot model + speed filters to candidate pool before choosing server
+- **Continue using runtime failure tracking:** Inference failures demote servers to `Unreliable` regardless of API health status
+- **CLI arguments:** New format: `--server "URL=NAME[capability=0-100,speed=0-100]"` where capability and speed are optional parameters embedded in the server string (both default to 0 if omitted). `--kv-q8 <model-name>` flag (repeatable) to specify models requiring 8-bit KV cache quantization.
+- **Documentation:** Update `--help` output and README with full selection hierarchy explanation and example scenarios
 
 ## Research
 
