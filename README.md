@@ -552,6 +552,7 @@ C:\Users\user\Downloads>ollama_load_balancer.exe --server http://192.168.150.134
 - **Quality vs. capacity tradeoffs:** Some models tolerate KV cache quantization (qwen3-32b with q8_0 for 11k context), others demand full precision (gpt-oss:20b, gemma3 require q16 for quality)
 - **Server capability tiers:** Fast servers, high-VRAM servers, and legacy servers all contributing to shared load balancing pool
 - **Dynamic configuration needs:** Ability to adjust KV cache settings per-model without manual server restarts
+- **Agentic workflow optimization:** Tools like [Claude Code](https://github.com/anthropics/claude-code), [Mistral Vibe CLI](https://github.com/BigBIueWhale/mistral_vibe_setup), and [continue.dev](https://www.continue.dev/) make rapid-fire sequential API calls within a single conversation—each call benefits enormously from KV cache locality when routed to the same server that processed previous requests in that session
 
 ![heterogenous concept](./doc/illustrations/heterogeneous_concept.png)
 
@@ -583,7 +584,7 @@ Poll each server's `/api/tags` endpoint (returns installed models: name, size, d
 #### Hot Model Preference (`GET /api/ps` on :11434)
 Poll each server's `/api/ps` endpoint (returns currently loaded models with VRAM usage, keep-alive status) to track which models are hot in memory. Within the server selection hierarchy (step 6), prefer servers where the requested model is already loaded to eliminate cold-start latency (5-60 seconds depending on model size and disk speed). This preference applies after filtering by availability, model availability, reliability, capability tier, and KV cache compatibility.
 
-**Immediate response capability:** When a model is already loaded in VRAM, inference begins immediately—users see the first token within milliseconds. This is critical for user experience. The load balancer should prefer servers with the requested model already hot, but only after applying capability tier and KV cache compatibility filters—hot model preference serves as a tiebreaker among servers that have already passed these earlier selection stages (see Server Selection Hierarchy below for the complete 8-step sequence).
+**Immediate response capability:** When a model is already loaded in VRAM, inference begins immediately—users see the first token within milliseconds. This is critical for user experience. The load balancer should prefer servers with the requested model already hot, but only after applying capability tier and KV cache compatibility filters—hot model preference serves as a tiebreaker among servers that have already passed these earlier selection stages (see Server Selection Hierarchy below for the complete 9-step sequence).
 
 **Note:** [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows) uses `OLLAMA_KEEP_ALIVE=-1`, so models remain loaded permanently after first use (no cold starts after initial warmup).
 
@@ -597,7 +598,7 @@ Current limitation: The load balancer assumes homogeneous servers—all have ide
 
 Users typically work around heterogeneous hardware by creating distinct model names via Ollama Modelfile (Server A: `qwen3-32b`, Server B: `qwen3-32b-32k`), analogous to configuring `"think": "high"` or context length. OpenWebUI shows both as separate choices. **This bypass doesn't work with our load balancer today**—because it's path-agnostic and model-unaware, it routes `qwen3-32b-32k` requests to any available server including Server A, which fails with OOM. Version 1.0.4 makes this user-side bypass work by routing each model name only to servers that advertise it.
 
-**Capability tier system:** Load balancer CLI will accept per-server capability and speed annotations embedded in the server string (e.g., `--server "http://192.168.1.10:11434=Server-A[capability=10,speed=100]"`). Capability values range from 0-100 (inclusive) where 0 represents lowest capability and 100 represents highest capability. Speed values range from 0-100 (inclusive) where 0 represents baseline/normal speed and 100 represents maximum speed. Both parameters are optional; if not specified, they default to 0. Server selection prefers **lower-capability servers** for tasks they can handle (preserving high-capability servers for demanding workloads), with additional tiebreakers (KV cache compatibility, hot model preference, speed) applied sequentially as described in the complete 8-step Server Selection Hierarchy below.
+**Capability tier system:** Load balancer CLI will accept per-server capability and speed annotations embedded in the server string (e.g., `--server "http://192.168.1.10:11434=Server-A[capability=10,speed=100]"`). Capability values range from 0-100 (inclusive) where 0 represents lowest capability and 100 represents highest capability. Speed values range from 0-100 (inclusive) where 0 represents baseline/normal speed and 100 represents maximum speed. Both parameters are optional; if not specified, they default to 0. Server selection prefers **lower-capability servers** for tasks they can handle (preserving high-capability servers for demanding workloads), with additional tiebreakers (KV cache compatibility, hot model preference, user affinity, speed) applied sequentially as described in the complete 9-step Server Selection Hierarchy below.
 
 #### KV Cache Optimization ([llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows))
 
@@ -635,13 +636,15 @@ When a client requests inference with model X, the load balancer selects a serve
 
 4. **Capability tier preference:** From the remaining candidates (reliable servers with model X from step 3), prefer the **lowest-capability tier**. For example, if model X is available on servers with capability 10 and capability 80, route to the capability 10 tier (preserving capability 80 tier for models that require it). Capability values are embedded in the server string (e.g., `--server "http://192.168.1.10:11434=Server-A[capability=10]"`, `--server "http://192.168.1.11:11434=Server-B[capability=80]"`). Servers without explicit capability annotation default to capability 0 (lowest). This capability tier preference only affects choice of which server will be chosen to serve a model, out of the possible servers that actually support that model—`/api/tags` model availability filtering (step 2) remains authoritative, but this addresses the case where a high-capability server also supports lower-tier models.
 
-5. **KV cache compatibility filter:** From the lowest-capability tier candidates (from step 4), prefer servers whose KV cache type (per `GET :11435/health`) currently matches the model's requirement (q8_0 if model is in `--kv-q8` list, q16 otherwise). If model X requires q8 but only q16 servers have it, optionally trigger dynamic reconfiguration—this **must** be designed to simulate the process of an Ollama server "ingesting the prompt": the user's request must connect (simulated while the server is restarting), then the moment the server is up, flood it with the kept request and stream the result. This logic requires careful design for non-blocking operation while respecting timeout constraints and quickly detecting when the server completes restart with the requested KV cache type. Must also handle edge cases: Ollama failing to restart (power disconnect), or failing to load the model (VRAM captured by another process). This dynamic reconfiguration path represents complex, high-risk logic requiring thorough edge case handling. To summarize: in this step we filter-out non-KV-Cache compatible servers, so only in the case that there are no kv-cache compatible servers, we counterintuitively skip step 6, and choose a server to convert its `KV_CACHE_TYPE` based on steps 7 and 8.
+5. **KV cache compatibility filter:** From the lowest-capability tier candidates (from step 4), prefer servers whose KV cache type (per `GET :11435/health`) currently matches the model's requirement (q8_0 if model is in `--kv-q8` list, q16 otherwise). If model X requires q8 but only q16 servers have it, optionally trigger dynamic reconfiguration—this **must** be designed to simulate the process of an Ollama server "ingesting the prompt": the user's request must connect (simulated while the server is restarting), then the moment the server is up, flood it with the kept request and stream the result. This logic requires careful design for non-blocking operation while respecting timeout constraints and quickly detecting when the server completes restart with the requested KV cache type. Must also handle edge cases: Ollama failing to restart (power disconnect), or failing to load the model (VRAM captured by another process). This dynamic reconfiguration path represents complex, high-risk logic requiring thorough edge case handling. To summarize: in this step we filter-out non-KV-Cache compatible servers, so only in the case that there are no kv-cache compatible servers, we counterintuitively skip steps 6 and 7, and choose a server to convert its `KV_CACHE_TYPE` based on steps 8 and 9.
 
 6. **Hot model preference:** From KV-cache-compatible candidates (from step 5), prefer servers where model X is already loaded in VRAM (per `/api/ps` polling). This eliminates cold-start latency (5-60 seconds). If multiple servers have model X hot, proceed to next tiebreaker. If no servers have model X hot, choose any server from the remaining candidates (will incur cold-start). Note: This preference only applies to servers that already have the correct `KV_CACHE_TYPE`. This step is not applied when we're in the path of choosing a server to have its `KV_CACHE_TYPE` converted.
 
-7. **Speed tiebreaker:** From remaining candidates (from step 6—servers in the same capability tier with model X hot and KV cache compatible), prefer the **fastest server**. Speed values are embedded in the server string (e.g., `--server "http://192.168.1.10:11434=Server-A[speed=100]"`, `--server "http://192.168.1.12:11434=Server-C[speed=100]"`). Servers without explicit speed annotation default to speed 0 (baseline/normal). Higher speed values are preferred over lower speed values.
+7. **User affinity (KV cache locality):** From candidates with hot model (from step 6), prefer the server where the **requesting user's conversation context is still cached**. The load balancer tracks which user (by client IP) last completed an inference request on each server—that user "owns" the server's KV cache until another user's inference request overwrites it. Inference endpoints that establish/invalidate ownership: `POST /api/generate`, `POST /api/chat`, `POST /v1/completions`, `POST /v1/chat/completions`. Metadata endpoints (`GET /api/tags`, `GET /api/ps`, `POST /api/show`, etc.) do **not** affect ownership. If the requesting user owns a candidate server's cache (same IP, same model), strongly prefer that server—this is the difference between instant prompt ingestion vs. reprocessing the entire conversation history (10-30+ seconds for large contexts). If the user owns no candidate, prefer servers with **older** ownership timestamps (previous owner less likely to return, cache is "staler" anyway) or no owner at all. This optimization is critical for agentic workflows ([Claude Code](https://github.com/anthropics/claude-code), [Mistral Vibe CLI](https://github.com/BigBIueWhale/mistral_vibe_setup), [continue.dev](https://www.continue.dev/)) where dozens of sequential API calls benefit enormously from KV cache reuse.
 
-8. **Fallback (CLI order):** From any remaining tied candidates (from step 7), choose the first server in CLI argument order (deterministic).
+8. **Speed tiebreaker:** From remaining candidates (from step 7—servers in the same capability tier with model X hot, KV cache compatible, and user affinity applied), prefer the **fastest server**. Speed values are embedded in the server string (e.g., `--server "http://192.168.1.10:11434=Server-A[speed=100]"`, `--server "http://192.168.1.12:11434=Server-C[speed=100]"`). Servers without explicit speed annotation default to speed 0 (baseline/normal). Higher speed values are preferred over lower speed values.
+
+9. **Fallback (CLI order):** From any remaining tied candidates (from step 8), choose the first server in CLI argument order (deterministic).
 
 **Example scenario:**
 ```
@@ -651,26 +654,55 @@ CLI args:
   --server "http://192.168.1.12:11434=ServerC[capability=80,speed=100]"
   --kv-q8 qwen3-32b
 
-Request: model=qwen3-32b
+Initial state:
+  ServerA: KV cache owner = None
+  ServerB: KV cache owner = None
+  ServerC: KV cache owner = None
+
+Request from 192.168.1.50: model=qwen3-32b
 1. Availability: ServerA (not busy), ServerB (not busy), ServerC (busy) → [ServerA, ServerB]
 2. Model installed: All have qwen3-32b → [ServerA, ServerB]
 3. Reliability: All are Reliable → [ServerA, ServerB]
 4. Capability: Prefer lowest tier (capability 10) → [ServerA, ServerB]
-5. KV cache: All are q8_0 (compatible), so no filtering happens here → [ServerA, ServerB]
-6. Hot model: ServerA has qwen3-32b loaded, ServerB does not → [ServerA]
-7. Speed: Only one server remains → ServerA selected
-8. Fallback: Not needed (only one candidate)
+5. KV cache type: All are q8_0 (compatible) → [ServerA, ServerB]
+6. Hot model: Both have qwen3-32b loaded → [ServerA, ServerB]
+7. User affinity: 192.168.1.50 owns neither; both unowned (equal) → [ServerA, ServerB]
+8. Speed: ServerA speed=100, ServerB speed=0 → [ServerA]
+9. Fallback: Not needed
+→ ServerA selected
+→ After completion: ServerA.owner = 192.168.1.50
 
-Request: model=gpt-oss:20b
+Request from 192.168.1.51: model=qwen3-32b
+1. Availability: ServerA (not busy), ServerB (not busy) → [ServerA, ServerB]
+2-6. (same filtering) → [ServerA, ServerB]
+7. User affinity: 192.168.1.51 owns neither. ServerA owned by 192.168.1.50, ServerB unowned.
+   Prefer unowned → [ServerB]
+→ ServerB selected
+→ After completion: ServerB.owner = 192.168.1.51
+
+Request from 192.168.1.50: model=qwen3-32b (second request, agentic workflow)
+1-6. → [ServerA, ServerB]
+7. User affinity: 192.168.1.50 owns ServerA's cache! → [ServerA]
+→ ServerA selected (KV cache reused—instant prompt ingestion)
+
+Request from 192.168.1.52: model=qwen3-32b (new user)
+1-6. → [ServerA, ServerB]
+7. User affinity: 192.168.1.52 owns neither. ServerA owned 10:00:00, ServerB owned 10:00:05.
+   Prefer older ownership → [ServerA]
+8. Speed: Only one candidate → ServerA selected
+→ After completion: ServerA.owner = 192.168.1.52 (overwrites 192.168.1.50's ownership)
+
+Request from 192.168.1.50: model=qwen3-32b (returning user, but cache was stolen)
+1-6. → [ServerA, ServerB]
+7. User affinity: 192.168.1.50 owns neither anymore. ServerA owned by .52 (newer), ServerB by .51 (older).
+   Prefer older → [ServerB]
+→ ServerB selected (must re-ingest prompt, but that's unavoidable—cache was overwritten)
+→ After completion: ServerB.owner = 192.168.1.50
+
+Request: model=gpt-oss:20b (from any user)
 1. Availability: ServerA (busy), ServerB (not busy), ServerC (not busy) → [ServerB, ServerC]
 2. Model installed: Only ServerC has gpt-oss:20b → [ServerC]
-3. Reliability: ServerC is Reliable → [ServerC]
-4. Capability: ServerC is capability 80 (only option) → [ServerC]
-5. KV cache: ServerC is q16 (compatible, gpt-oss not in --kv-q8 list) → [ServerC]
-6. Hot model: Not applicable (only one candidate) → [ServerC]
-7. Speed: Not applicable (only one candidate) → [ServerC]
-8. Fallback: Not needed (only one candidate)
-→ ServerC selected
+3-9. Only one candidate throughout → ServerC selected
 ```
 
 **Why runtime failure tracking remains critical:** Health check APIs (e.g., [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows) `GET :11435/health`) exist but are **not useful** for reliability assessment. A server can be network-reachable, report `{"status":"healthy"}`, and still fail every inference request due to insufficient VRAM (model loaded but KV cache allocation fails), corrupted model files (checksum passes but inference crashes), driver bugs (CUDA/ROCm errors mid-stream), or thermal throttling (starts OK, fails after 30 seconds). **The authoritative test is the result of actual inference.** The existing `Reliable`/`Unreliable`/`SecondChanceGiven` failure tracking logic (src/main.rs:244-254, 382-409) must remain the primary mechanism for server tier ranking. Model-aware routing operates **within the pool of `Reliable` servers**—it decides which `Reliable` server to route to based on model availability and load distribution, but runtime failures still demote servers to `Unreliable` regardless of what APIs report.
@@ -682,13 +714,15 @@ Request: model=gpt-oss:20b
 
 #### Implementation Notes
 - **Background polling threads** per server (30-60s intervals for `/api/tags` and `/api/ps`, 10-30s for `/health`)
-- **In-memory cluster state:** installed models per server, loaded models per server, KV cache type per server, capability tier per server, speed tier per server
+- **In-memory cluster state:** installed models per server, loaded models per server, KV cache type per server, capability tier per server, speed tier per server, KV cache owner (IP + timestamp + model) per server
 - **Intercept `GET /api/tags` and `GET /v1/models`:** Respond directly with aggregated data (union of all models across all servers) instead of proxying to random server
-- **Parse inference requests:** Extract `model` field from JSON body of `/api/chat`, `/api/generate`, `/v1/chat/completions` requests
-- **Filter candidates before selection:** Apply the 8-step sequential hierarchy: availability → model availability → reliability → capability tier → KV cache compatibility → hot model (only if we don't need to convert KV cache type) → speed → CLI order fallback
+- **Parse inference requests:** Extract `model` field from JSON body of `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions` requests—these are the only endpoints that establish/invalidate KV cache ownership
+- **User affinity tracking:** On successful inference completion (stream ends without error in `ResponseBodyWithGuard`), record `(owner_ip, timestamp, model)` for that server. Ownership persists until overwritten by another user's inference request.
+- **Filter candidates before selection:** Apply the 9-step sequential hierarchy: availability → model availability → reliability → capability tier → KV cache compatibility → hot model → user affinity → speed → CLI order fallback
 - **Continue using runtime failure tracking:** Inference failures demote servers to `Unreliable` regardless of API health status
 - **CLI arguments:** New format: `--server "URL=NAME[capability=0-100,speed=0-100]"` where capability and speed are optional parameters embedded in the server string (both default to 0 if omitted). `--kv-q8 <model-name>` flag (repeatable) to specify models requiring 8-bit KV cache quantization. It's highly recommended to place the highest amount of servers at the lowest capability tier, because if you have (for example) only one server at the lowest capability tier, that's likely to cause that same poor low-tiered server to be converted back and forth between `KV_CACHE_TYPE` and models being constantly unloaded to switch models. This low tier is designed to serve the masses, to relieve the load- so take that into account.
-- **Configurable bind address:** Add `--bind <IP:PORT>` CLI argument. The current hard-coded `127.0.0.1:11434` is ridiculous. Default should be `127.0.0.1:11434`, with `0.0.0.0:11434` for network-wide access.
+- **Configurable bind address:** Add `--bind <IP:PORT>` CLI argument. The current hard-coded `0.0.0.0:11434` should become configurable. Default should be `127.0.0.1:11434` for security, with `0.0.0.0:11434` for network-wide access.
+- **Increase default timeout to 2 minutes:** Radio silence before first token can be significant: model loading from a slow SSD can take 30-60 seconds, and prompt ingestion for 104k+ token contexts can take another 30-60 seconds. The current 30-second default causes premature abandonment. Change default from 30 to 120 seconds. The 1-second TCP `connect_timeout` remains unchanged—establishing a TCP connection should be immediate.
 - **Documentation:** Update `--help` output and README with full selection hierarchy explanation and reasoning + incentives + vision behind all this stuff.
 
 ## Research
