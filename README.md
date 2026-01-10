@@ -725,6 +725,387 @@ Request: model=gpt-oss:20b (from any user)
 - **Increase default timeout to 2 minutes:** Radio silence before first token can be significant: model loading from a slow SSD can take 30-60 seconds, and prompt ingestion for 104k+ token contexts can take another 30-60 seconds. The current 30-second default causes premature abandonment. Change default from 30 to 120 seconds. The 1-second TCP `connect_timeout` remains unchanged—establishing a TCP connection should be immediate.
 - **Documentation:** Update `--help` output and README with full selection hierarchy explanation and reasoning + incentives + vision behind all this stuff.
 
+### Error Handling Philosophy
+
+**Panicking is a sin.** If someone integrates this load balancer into a larger system, we must never crash their process. Errors we have a specific action plan for (e.g., upstream server unreachable → return HTTP 502) should be handled inline. **Every other error must propagate upward** via `Result` so higher-level code can decide what to do—log and continue, restart internal state, or escalate. This is the C++ `std::runtime_error` philosophy: detailed human-readable messages describing what was observed versus expected, with stack unwinding to let the caller decide.
+
+We use **two layers of defense**:
+1. **`Result<T, Box<dyn std::error::Error + Send + Sync>>`** for normal error propagation via `?`
+2. **`FutureExt::catch_unwind` / `StreamExt::catch_unwind`** from the [`futures`](https://docs.rs/futures) crate as a panic catch-all for any unexpected panics that slip through (bugs, library panics, etc.)
+
+#### Critical: Async Panic Catching
+
+**`std::panic::catch_unwind` does NOT work for async code.** Because futures are lazy—they only execute when polled—wrapping a future's creation in `std::panic::catch_unwind` won't catch panics that occur during `.await`. You must use the async-aware versions from the `futures` crate:
+
+- **For Futures:** [`FutureExt::catch_unwind()`](https://docs.rs/futures-util/latest/futures_util/future/trait.FutureExt.html#method.catch_unwind)
+- **For Streams:** [`StreamExt::catch_unwind()`](https://docs.rs/futures-util/latest/futures_util/stream/trait.StreamExt.html#method.catch_unwind)
+
+Both require the `UnwindSafe` trait bound, which can be satisfied using `std::panic::AssertUnwindSafe` wrapper.
+
+#### Hyper 0.14 Panic Behavior
+
+When a panic occurs in a hyper 0.14 `service_fn` handler:
+1. Hyper (via tokio) catches the panic at the connection level
+2. The panicking connection is **abruptly terminated** (TCP RST)
+3. The server continues running—other connections are unaffected
+4. The client receives **no HTTP response**, just a dropped connection
+
+This is acceptable for crash isolation, but poor for user experience. By adding our own `catch_unwind`, we can return a proper **HTTP 500** response instead of dropping the connection. See the [hyper panic handling guide](https://vorner.github.io/2020/04/13/hyper-traps.html) for background.
+
+#### Execution Contexts and Error Propagation
+
+The current codebase has these execution contexts. For each, we show the current state and the v1.0.4 target:
+
+**1. `main()` — Application entry point**
+```rust
+// CURRENT:
+async fn main() -> Result<(), Box<dyn std::error::Error>> { ... }
+```
+This already returns `Box<dyn std::error::Error>`, so errors can propagate naturally. No changes needed—this is the top-level catch point.
+
+**2. `shutdown_signal()` — Graceful shutdown future**
+```rust
+// CURRENT:
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to listen for ctrl_c");  // PANICS!
+}
+
+// v1.0.4 TARGET:
+async fn shutdown_signal() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tokio::signal::ctrl_c().await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("Failed to register OS signal handler for CTRL+C: {}", e).into()
+    })?;
+    println!("☠️  Received CTRL+C, shutting down gracefully...");
+    Ok(())
+}
+```
+The error propagates to `main()` via the graceful shutdown mechanism, which can then decide how to handle signal registration failure.
+
+**Note:** The `with_graceful_shutdown` method in hyper 0.14 expects a future that resolves when shutdown is requested. If that future returns a `Result`, you'll need to handle it appropriately—either by using `unwrap_or_else` or by restructuring to log the error and continue with shutdown.
+
+**3. `handle_request()` — Per-request HTTP handler**
+```rust
+// CURRENT:
+async fn handle_request(...) -> Result<Response<Body>, Infallible> { ... }
+//                                                      ^^^^^^^^^
+//                              Claims "I never fail" — but panics bypass this!
+```
+The `Infallible` error type is a **lie**. The function contains `.unwrap()` calls that panic, and panics are not `Result` errors—they bypass the return type entirely.
+
+```rust
+// v1.0.4 TARGET:
+use futures::FutureExt;  // For catch_unwind on futures
+use std::panic::AssertUnwindSafe;
+
+async fn handle_request_inner(
+    req: Request<Body>,
+    servers: SharedServerList,
+    remote_addr: std::net::SocketAddr,
+    timeout_secs: u32,
+) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
+    // All .unwrap() replaced with ? — errors propagate upward
+    let client = builder.build().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("Failed to build HTTP client (TLS or DNS resolver error): {}", e).into()
+    })?;
+
+    let servers_lock = servers.lock().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("Server list mutex poisoned (previous handler panicked): {}", e).into()
+    })?;
+
+    // ... etc
+}
+
+// Wrapper that converts errors to HTTP 500 AND catches panics:
+async fn handle_request(
+    req: Request<Body>,
+    servers: SharedServerList,
+    remote_addr: std::net::SocketAddr,
+    timeout_secs: u32,
+) -> Result<Response<Body>, Infallible> {
+    // CRITICAL: Use FutureExt::catch_unwind for async, NOT std::panic::catch_unwind
+    let future = handle_request_inner(req, servers, remote_addr, timeout_secs);
+    let result = AssertUnwindSafe(future).catch_unwind().await;
+
+    let response = match result {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => {
+            // Normal error — propagated via Result from handle_request_inner
+            eprintln!("Request handler error: {}", e);
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(format!("Internal error: {}", e)))
+                .unwrap_or_else(|_| Response::new(Body::from("Internal error")))
+        }
+        Err(panic_payload) => {
+            // Panic was caught — extract message and return HTTP 500
+            let msg = panic_payload
+                .downcast_ref::<&str>().map(|s| s.to_string())
+                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "Unknown panic".to_string());
+            eprintln!("PANIC in request handler: {}", msg);
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("Internal server error"))
+                .unwrap_or_else(|_| Response::new(Body::from("Internal error")))
+        }
+    };
+    Ok(response)
+}
+```
+
+**Why `FutureExt::catch_unwind` works:** It wraps the future and catches any panic that occurs during any of its `poll()` calls. The panic (if any) becomes the `Err` variant of the result. See [futures-util documentation](https://docs.rs/futures-util/latest/futures_util/future/trait.FutureExt.html#method.catch_unwind).
+
+**4. `select_available_server()` — Server selection logic**
+```rust
+// CURRENT:
+async fn select_available_server(...) -> Option<String> {
+    let mut servers_lock = servers.lock().unwrap();  // PANICS on poison!
+    // ...
+}
+
+// v1.0.4 TARGET:
+async fn select_available_server(
+    servers: &SharedServerList,
+    remote_addr: &std::net::SocketAddr,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut servers_lock = servers.lock().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("Cannot select server: mutex poisoned while acquiring lock. \
+                 A previous request handler panicked, leaving server list in unknown state. \
+                 Poison error: {}", e).into()
+    })?;
+    // ... rest of logic unchanged, but returns Ok(Some(...)) or Ok(None)
+}
+```
+The `Option<String>` for "no servers available" is a **handled case** (we return HTTP 503). The mutex poison is an **unhandled case** that propagates upward.
+
+**5. `ServerGuard::drop()` — Cleanup on scope exit**
+```rust
+// CURRENT:
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let mut servers_lock = self.servers.lock().unwrap();  // PANICS!
+        // ...
+    }
+}
+```
+**This is dangerous.** If `drop()` is called during unwinding from another panic, and `drop()` itself panics (from `.unwrap()`), Rust **aborts the process**. Double-panic = abort, no recovery possible.
+
+```rust
+// v1.0.4 TARGET:
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        // In Drop, we CANNOT propagate errors via Result. We MUST handle inline.
+        // Use match to recover from poisoning rather than double-panic.
+        let mut servers_lock = match self.servers.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // Recover the guard despite poisoning — better than aborting
+                eprintln!("WARNING: ServerGuard::drop() encountered poisoned mutex. \
+                           Recovering to mark server {} as available, but state may be inconsistent.",
+                           self.key);
+                poisoned.into_inner()
+            }
+        };
+        // ... rest of cleanup
+    }
+}
+```
+
+**6. `ResponseBodyWithGuard::poll_next()` — Stream polling during response**
+```rust
+// CURRENT:
+fn poll_next(...) -> Poll<Option<Self::Item>> {
+    // ...
+    let mut servers_lock = self.servers.lock().unwrap();  // PANICS!
+    // ...
+}
+```
+This is called by hyper's runtime while streaming the response body. A panic here propagates to hyper's connection handler.
+
+```rust
+// v1.0.4 TARGET:
+fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    // ...
+    // Our Stream's Item is Result<bytes::Bytes, std::io::Error>, so we CAN propagate errors.
+    // However, for mutex poisoning during cleanup, recovery is preferred:
+    let mut servers_lock = match self.servers.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            // Option A: Recover and continue (preferred for state-update operations)
+            eprintln!("WARNING: Mutex poisoned during stream poll, recovering");
+            poisoned.into_inner()
+
+            // Option B: Return error through the stream (terminates response mid-stream)
+            // return Poll::Ready(Some(Err(std::io::Error::new(
+            //     std::io::ErrorKind::Other,
+            //     "Internal state corrupted: mutex poisoned during streaming"
+            // ))));
+        }
+    };
+    // ...
+}
+```
+
+**Alternative: `StreamExt::catch_unwind`** — If you want to catch panics that occur during stream polling (e.g., from the underlying `reqwest` stream), you can wrap the stream:
+
+```rust
+use futures::StreamExt;
+use std::panic::AssertUnwindSafe;
+
+let safe_stream = AssertUnwindSafe(response.bytes_stream()).catch_unwind();
+// Now safe_stream yields Result<Result<Bytes, reqwest::Error>, Box<dyn Any + Send>>
+// where the outer Err indicates a panic occurred
+```
+
+However, this changes the stream's item type and requires additional handling. For the custom `ResponseBodyWithGuard`, directly handling poison errors in `poll_next` (as shown above) is simpler.
+
+#### The Panic Catch-All (Belt and Suspenders)
+
+Even with all `.unwrap()` removed, panics can still occur:
+- Bugs in our logic (index out of bounds, integer overflow with `panic` profile, etc.)
+- Panics from library code we call
+- `assert!()` failures
+
+**Approach 1: `FutureExt::catch_unwind` (Recommended)**
+
+The simplest and most direct approach for async handlers:
+
+```rust
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
+
+async fn handle_with_panic_catching(req: Request<Body>) -> Response<Body> {
+    let result = AssertUnwindSafe(actual_handler(req)).catch_unwind().await;
+
+    match result {
+        Ok(response) => response,
+        Err(panic_payload) => {
+            let msg = extract_panic_message(&panic_payload);
+            eprintln!("PANIC caught: {}", msg);
+            error_response(500, "Internal server error")
+        }
+    }
+}
+
+fn extract_panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload.downcast_ref::<&str>().map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "Unknown panic".to_string())
+}
+```
+
+**Approach 2: `tokio::spawn` with `JoinHandle` (Alternative)**
+
+Spawning into a separate task provides panic isolation, but adds overhead and complexity:
+
+```rust
+let handle = tokio::spawn(async move {
+    handle_request_inner(req, servers, remote_addr, timeout).await
+});
+
+match handle.await {
+    Ok(Ok(response)) => response,
+    Ok(Err(e)) => {
+        // Normal error — propagated via Result
+        eprintln!("Request error: {}", e);
+        error_response(500, &format!("Internal error: {}", e))
+    }
+    Err(join_error) => {
+        // Task panicked or was cancelled
+        if join_error.is_panic() {
+            let panic_payload = join_error.into_panic();
+            let msg = extract_panic_message(&panic_payload);
+            eprintln!("PANIC in spawned task: {}", msg);
+            error_response(500, "Internal server error (panic)")
+        } else {
+            // Task was cancelled (e.g., runtime shutdown)
+            eprintln!("Task cancelled");
+            error_response(500, "Request cancelled")
+        }
+    }
+}
+```
+
+See [`JoinError` documentation](https://docs.rs/tokio/latest/tokio/task/struct.JoinError.html) for details on `is_panic()` and `into_panic()`.
+
+**Why prefer `FutureExt::catch_unwind`?** It's simpler, doesn't require spawning a new task, and integrates naturally with hyper's service model. Use `tokio::spawn` when you need true task isolation (e.g., the handler should continue even if the connection is dropped).
+
+**Important Caveats:**
+- `catch_unwind` only catches **unwinding** panics. If `panic = "abort"` is set in `Cargo.toml`, panics abort immediately and cannot be caught. We rely on the default `panic = "unwind"`.
+- `AssertUnwindSafe` is a promise to the compiler that the wrapped value is safe across panic boundaries. This is generally true for our use case (HTTP handlers), but be aware that state may be inconsistent after a caught panic.
+
+#### Mutex Choice: `std::sync::Mutex` vs `tokio::sync::Mutex`
+
+The current codebase uses `std::sync::Mutex`, which has **poisoning semantics**: if a thread panics while holding the lock, the mutex becomes "poisoned" and subsequent `lock()` calls return `Err(PoisonError)`.
+
+**Alternative: `tokio::sync::Mutex`**
+
+[`tokio::sync::Mutex`](https://docs.rs/tokio/latest/tokio/sync/struct.Mutex.html) does **NOT** poison:
+- On panic, it simply unlocks (the data may be inconsistent)
+- `lock().await` always succeeds (returns the guard directly, not a `Result`)
+- Trade-off: You lose the "something went wrong" signal that poisoning provides
+
+For this load balancer, `std::sync::Mutex` is preferred because:
+1. Lock hold times are very short (just reading/updating state)
+2. We never `.await` while holding the lock (so no risk of holding across yield points)
+3. Poisoning alerts us to bugs that corrupted state
+
+If you want to eliminate all `PoisonError` handling, switch to `tokio::sync::Mutex`—but accept that corrupted state may silently persist.
+
+#### Library Error Types (Cargo.toml versions: hyper 0.14, reqwest 0.12, tokio 1, futures-util 0.3)
+
+All error types in our dependency tree implement `std::error::Error + Display`, making them compatible with `Box<dyn std::error::Error>`:
+
+| API | Error Type | Propagates via `?` | Notes |
+|-----|------------|-------------------|-------|
+| [`Mutex::lock()`](https://doc.rust-lang.org/std/sync/struct.Mutex.html) | `PoisonError<MutexGuard<T>>` | Yes | Use `.into_inner()` to recover data in Drop contexts |
+| [`reqwest::ClientBuilder::build()`](https://docs.rs/reqwest/0.12/reqwest/struct.ClientBuilder.html) | `reqwest::Error` | Yes | Fails on TLS backend init or DNS resolver config. Can also fail with `hickory-dns` feature on malformed system DNS config. |
+| [`Response::builder().body()`](https://docs.rs/http/latest/http/response/struct.Builder.html#method.body) | `http::Error` | Yes | Fails if **earlier** builder calls set invalid data (e.g., malformed headers). With our static/validated inputs, this won't fail. |
+| [`tokio::signal::ctrl_c()`](https://docs.rs/tokio/latest/tokio/signal/fn.ctrl_c.html) | `std::io::Error` | Yes | Fails if OS signal handler can't be registered |
+| [`HeaderValue::to_str()`](https://docs.rs/http/latest/http/header/struct.HeaderValue.html#method.to_str) | `ToStrError` | Yes | Fails if header contains non-visible ASCII (bytes outside 32-126, except tab). This is **not** a UTF-8 check—HTTP headers can contain bytes 128-255 which are valid but not "visible ASCII". Use `as_bytes()` and convert as needed. |
+| [`FutureExt::catch_unwind()`](https://docs.rs/futures-util/latest/futures_util/future/trait.FutureExt.html#method.catch_unwind) | `Box<dyn Any + Send>` | Via match | Catches panics during future polling. The `Err` variant contains the panic payload. |
+| [`StreamExt::catch_unwind()`](https://docs.rs/futures-util/latest/futures_util/stream/trait.StreamExt.html#method.catch_unwind) | `Box<dyn Any + Send>` | Via match | Same as above, but for streams. Caught panic becomes the final stream item. |
+
+**Note on `HeaderValue::to_str()` in current code:** The existing code at line 219 uses `.to_str().unwrap()` when copying response headers. This can panic if the upstream Ollama server returns a header with non-visible ASCII characters. The fix is:
+```rust
+// Instead of:
+resp_builder = resp_builder.header(key_h.to_string(), value.to_str().unwrap());
+
+// Use:
+resp_builder = resp_builder.header(key_h.as_str(), value.as_bytes());
+// or with graceful handling:
+if let Ok(v) = value.to_str() {
+    resp_builder = resp_builder.header(key_h.as_str(), v);
+}
+```
+
+#### Summary: What Gets Handled vs. What Propagates
+
+| Error Scenario | Action Plan? | Handling |
+|---------------|--------------|----------|
+| Upstream Ollama server unreachable | **Yes** | Return HTTP 502 Bad Gateway |
+| No servers available | **Yes** | Return HTTP 503 Service Unavailable |
+| Invalid HTTP method from client | **Yes** | Return HTTP 405 Method Not Allowed |
+| Mutex poisoned | **No** | Propagate `Box<dyn Error>` upward (or recover in Drop via `into_inner()`) |
+| TLS/DNS init failed | **No** | Propagate upward |
+| Signal handler registration failed | **No** | Propagate upward |
+| Unexpected panic | **No** | Catch via `FutureExt::catch_unwind`, log, return HTTP 500 |
+| Header contains non-visible ASCII | **Context-dependent** | Use `as_bytes()` to copy verbatim, or skip/transform the header |
+
+The principle: **handle what you have a plan for; propagate everything else.** Never panic, never abort, never crash the caller's process.
+
+#### References
+
+- [Hyper Traps: Panic Handling](https://vorner.github.io/2020/04/13/hyper-traps.html) — Essential reading on catching panics in hyper services
+- [futures-util FutureExt](https://docs.rs/futures-util/latest/futures_util/future/trait.FutureExt.html) — `catch_unwind` for async futures
+- [futures-util StreamExt](https://docs.rs/futures-util/latest/futures_util/stream/trait.StreamExt.html) — `catch_unwind` for async streams
+- [tokio JoinError](https://docs.rs/tokio/latest/tokio/task/struct.JoinError.html) — Panic handling for spawned tasks
+- [Rust Mutex Poisoning](https://doc.rust-lang.org/std/sync/struct.Mutex.html#poisoning) — When and why mutexes poison
+- [tokio::sync::Mutex](https://docs.rs/tokio/latest/tokio/sync/struct.Mutex.html) — Non-poisoning alternative (note: more expensive, designed for holding across `.await`)
+- [hyper 0.14 Upgrade Guide](https://hyper.rs/guides/1/upgrading/) — Preparing for hyper 1.0 migration
+
 ## Research
 
 I set up an Ollama server running on my local network.
