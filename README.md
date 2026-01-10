@@ -220,6 +220,8 @@ These are the versions I used:
 > **Note:** The VM-based setup described below is **only required to simulate production network topology** where multiple physical servers run Ollama on the same port (11434) with different IP addresses.
 >
 > This complexity exists because an OS typically restricts each subnet to a single network interface card. Virtual machines bypass this limitation by providing isolated network stacks with unique IP addresses.
+>
+> **Looking for automated testing?** See the [Testing](#testing) section for an Ollama simulator approach that doesn't require running VMs.
 
 1. Use a Windows host with at least 64 gigabytes of RAM and at least 8 CPU cores so that you can run [three virtual machines at the same time](./doc/screenshots/virtual_machines_running_ollama.png).
 
@@ -1106,6 +1108,44 @@ The principle: **handle what you have a plan for; propagate everything else.** N
 - [Rust Mutex Poisoning](https://doc.rust-lang.org/std/sync/struct.Mutex.html#poisoning) — When and why mutexes poison
 - [tokio::sync::Mutex](https://docs.rs/tokio/latest/tokio/sync/struct.Mutex.html) — Non-poisoning alternative (note: more expensive, designed for holding across `.await`)
 - [hyper 0.14 Upgrade Guide](https://hyper.rs/guides/1/upgrading/) — Preparing for hyper 1.0 migration
+
+## Testing
+
+### Basic Testing
+
+For basic validation of load balancer functionality with non-streaming HTTP POST requests and GET requests, use the [test script](./test/test_static_http_post_request.py):
+
+```sh
+python3 -m pip install requests
+python3 test/test_static_http_post_request.py
+```
+
+This script sends a non-streaming `/api/chat` request and a `/api/tags` GET request to verify the load balancer is proxying correctly.
+
+### Testing with Real Ollama Servers
+
+For comprehensive testing against real Ollama servers, the [Lab testing](#lab-testing) section describes a multi-VM approach. This involves running multiple virtual machines on a single host, each with its own network interface and IP address, allowing you to simulate a production environment where multiple physical Ollama servers exist on the network.
+
+This approach is ideal for:
+- End-to-end integration testing with actual model inference
+- Testing reliability features (server failure, recovery, `Unreliable`/`SecondChanceGiven` states)
+- Performance testing with real streaming responses
+- Validating behavior under concurrent load from multiple clients
+
+### Automated Testing with Ollama Simulator (Planned)
+
+The [Ollama API observation document](./test/ollama_observation/README.md) contains detailed documentation of Ollama's HTTP API behavior captured from Ollama version 0.13.5. This includes:
+
+- Exact response formats, headers, and timing characteristics for all endpoints
+- Streaming formats (NDJSON for native API, SSE for OpenAI-compatible API)
+- Error responses and edge cases
+- Token generation timing and chunk intervals
+
+**Future plan:** Use these observations to create an **Ollama simulator**—a mock server that accurately replicates Ollama's behavior without requiring GPU hardware or actual model inference. This will enable:
+
+- Fast, deterministic automated tests that run in CI/CD pipelines
+- Testing of edge cases (timeouts, mid-stream failures, server crashes) that are difficult to reproduce with real servers
+- Validation of the v1.0.4 model-aware routing logic without needing multiple physical servers
 
 ## Research
 
