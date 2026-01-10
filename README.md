@@ -688,6 +688,7 @@ Request: model=gpt-oss:20b
 - **Filter candidates before selection:** Apply the 8-step sequential hierarchy: availability → model availability → reliability → capability tier → KV cache compatibility → hot model (only if we don't need to convert KV cache type) → speed → CLI order fallback
 - **Continue using runtime failure tracking:** Inference failures demote servers to `Unreliable` regardless of API health status
 - **CLI arguments:** New format: `--server "URL=NAME[capability=0-100,speed=0-100]"` where capability and speed are optional parameters embedded in the server string (both default to 0 if omitted). `--kv-q8 <model-name>` flag (repeatable) to specify models requiring 8-bit KV cache quantization. It's highly recommended to place the highest amount of servers at the lowest capability tier, because if you have (for example) only one server at the lowest capability tier, that's likely to cause that same poor low-tiered server to be converted back and forth between `KV_CACHE_TYPE` and models being constantly unloaded to switch models. This low tier is designed to serve the masses, to relieve the load- so take that into account.
+- **Configurable bind address:** Add `--bind <IP:PORT>` CLI argument. The current hard-coded `127.0.0.1:11434` is ridiculous. Default should be `127.0.0.1:11434`, with `0.0.0.0:11434` for network-wide access.
 - **Documentation:** Update `--help` output and README with full selection hierarchy explanation and reasoning + incentives + vision behind all this stuff.
 
 ## Research
