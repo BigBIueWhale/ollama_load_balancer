@@ -727,6 +727,7 @@ Request: model=gpt-oss:20b (from any user)
 - **Increase default timeout to 2 minutes:** Radio silence before first token can be significant: model loading from a slow SSD can take 30-60 seconds, and prompt ingestion for 104k+ token contexts can take another 30-60 seconds. The current 30-second default causes premature abandonment. Change default from 30 to 120 seconds. The 1-second TCP `connect_timeout` remains unchanged—establishing a TCP connection should be immediate.
 - **Standardized logging:** Add datetime timestamps to all log output, with configuration supporting multi-line log entries sharing a single timestamp (all output remains on stdout).
 - **Documentation:** Update `--help` output and README with full selection hierarchy explanation and reasoning + incentives + vision behind all this stuff.
+- **Testing with large VLM requests:** Verify the load balancer handles very slow, large image-based requests from tools like [convert_pdf_to_md_vl.py](https://github.com/BigBIueWhale/deep_intent_search/blob/master/convert_pdf_to_md_vl.py). Converting a 1214-page PDF (e.g., `ug1085-zynq-ultrascale-trm.pdf`) with `qwen3-vl:32b-thinking` generates 3166x4096 PNG images per page; combined with the model's extended thinking (~14k thinking tokens + ~800 response tokens per page at ~60 tok/sec generation), each page takes multiple minutes. Version 1.0.3 fails these requests; 1.0.4 must handle them correctly.
 
 ### Error Handling Philosophy
 
