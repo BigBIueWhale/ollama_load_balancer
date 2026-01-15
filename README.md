@@ -554,7 +554,7 @@ C:\Users\user\Downloads>ollama_load_balancer.exe --server http://192.168.150.134
 - **Quality vs. capacity tradeoffs:** Some models tolerate KV cache quantization (qwen3-32b with q8_0 for 11k context), others demand full precision (gpt-oss:20b, gemma3 require q16 for quality)
 - **Server capability tiers:** Fast servers, high-VRAM servers, and legacy servers all contributing to shared load balancing pool
 - **Dynamic configuration needs:** Ability to adjust KV cache settings per-model without manual server restarts
-- **Agentic workflow optimization:** Tools like [Claude Code](https://github.com/anthropics/claude-code), [Mistral Vibe CLI](https://github.com/BigBIueWhale/mistral_vibe_setup), and [continue.dev](https://www.continue.dev/) make rapid-fire sequential API calls within a single conversation—each call benefits enormously from KV cache locality when routed to the same server that processed previous requests in that session
+- **Agentic workflow optimization:** Tools like [Claude Code](https://github.com/anthropics/claude-code) and [Mistral Vibe CLI](https://github.com/BigBIueWhale/mistral_vibe_setup) make rapid-fire sequential API calls within a single conversation—each call benefits enormously from KV cache locality when routed to the same server that processed previous requests in that session. Users of [openwebui_config](https://github.com/BigBIueWhale/openwebui_config) also benefit from quicker follow-up responses when their conversation is routed back to the server that has their context cached
 
 ![heterogenous concept](./doc/illustrations/heterogeneous_concept.png)
 
@@ -600,7 +600,7 @@ Current limitation: The load balancer assumes homogeneous servers—all have ide
 
 Users typically work around heterogeneous hardware by creating distinct model names via Ollama Modelfile (Server A: `qwen3-32b`, Server B: `qwen3-32b-32k`), analogous to configuring `"think": "high"` or context length. OpenWebUI shows both as separate choices. **This bypass doesn't work with our load balancer today**—because it's path-agnostic and model-unaware, it routes `qwen3-32b-32k` requests to any available server including Server A, which fails with OOM. Version 1.0.4 makes this user-side bypass work by routing each model name only to servers that advertise it.
 
-**Capability tier system:** Load balancer CLI will accept per-server capability and speed annotations embedded in the server string (e.g., `--server "http://192.168.1.10:11434=Server-A[capability=10,speed=100]"`). Capability values range from 0-100 (inclusive) where 0 represents lowest capability and 100 represents highest capability. Speed values range from 0-100 (inclusive) where 0 represents baseline/normal speed and 100 represents maximum speed. Both parameters are optional; if not specified, they default to 0. Server selection prefers **lower-capability servers** for tasks they can handle (preserving high-capability servers for demanding workloads), with additional tiebreakers (KV cache compatibility, hot model preference, user affinity, speed) applied sequentially as described in the complete 9-step Server Selection Hierarchy below.
+**Capability tier system:** Load balancer CLI will accept per-server capability and speed annotations embedded in the server string (e.g., `--server "http://192.168.1.10:11434=Server-A[capability=10,speed=100]"`). Capability values range from 0-100 (inclusive) where 0 represents lowest capability and 100 represents highest capability. Speed values range from 0-100 (inclusive) where 0 represents baseline/normal speed and 100 represents maximum speed. Both parameters are optional; if not specified, they default to 0. Server selection prefers **lower-capability servers** for tasks they can handle (preserving high-capability servers for demanding workloads), with additional tiebreakers (KV cache compatibility, hot model preference, conversation affinity, speed) applied sequentially as described in the complete 9-step Server Selection Hierarchy below.
 
 #### KV Cache Optimization ([llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows))
 
@@ -642,9 +642,26 @@ When a client requests inference with model X, the load balancer selects a serve
 
 6. **Hot model preference:** From KV-cache-compatible candidates (from step 5), prefer servers where model X is already loaded in VRAM (per `/api/ps` polling). This eliminates cold-start latency (5-60 seconds). If multiple servers have model X hot, proceed to next tiebreaker. If no servers have model X hot, choose any server from the remaining candidates (will incur cold-start). Note: This preference only applies to servers that already have the correct `KV_CACHE_TYPE`. This step is not applied when we're in the path of choosing a server to have its `KV_CACHE_TYPE` converted.
 
-7. **User affinity (KV cache locality):** From candidates with hot model (from step 6), prefer the server where the **requesting user's conversation context is still cached**. The load balancer tracks which user (by client IP) last completed an inference request on each server—that user "owns" the server's KV cache until another user's inference request overwrites it. Inference endpoints that establish/invalidate ownership: `POST /api/generate`, `POST /api/chat`, `POST /v1/completions`, `POST /v1/chat/completions`. Metadata endpoints (`GET /api/tags`, `GET /api/ps`, `POST /api/show`, etc.) do **not** affect ownership. If the requesting user owns a candidate server's cache (same IP, same model), strongly prefer that server—this is the difference between instant prompt ingestion vs. reprocessing the entire conversation history (10-30+ seconds for large contexts). If the user owns no candidate, prefer servers with **older** ownership timestamps (previous owner less likely to return, cache is "staler" anyway) or no owner at all. This optimization is critical for agentic workflows ([Claude Code](https://github.com/anthropics/claude-code), [Mistral Vibe CLI](https://github.com/BigBIueWhale/mistral_vibe_setup), [continue.dev](https://www.continue.dev/)) where dozens of sequential API calls benefit enormously from KV cache reuse.
+7. **Conversation affinity (KV cache locality):** From candidates with hot model (from step 6), prefer the server whose cached request has significant **prefix overlap** with the incoming request.
 
-8. **Speed tiebreaker:** From remaining candidates (from step 7—servers in the same capability tier with model X hot, KV cache compatible, and user affinity applied), prefer the **fastest server**. Speed values are embedded in the server string (e.g., `--server "http://192.168.1.10:11434=Server-A[speed=100]"`, `--server "http://192.168.1.12:11434=Server-C[speed=100]"`). Servers without explicit speed annotation default to speed 0 (baseline/normal). Higher speed values are preferred over lower speed values.
+   **Why not use client IP?** Source IP is unreliable for identifying conversations:
+   - **OpenWebUI/proxy scenarios:** All users' requests arrive from the same IP (the proxy server)
+   - **Multi-agent workflows:** When Claude Code spawns search agents, each agent deserves its own cache affinity despite sharing source IP
+   - **NAT/corporate networks:** Multiple users share a single public IP
+
+   **How it works:** Each server "owns" its most recent inference request. When a new request arrives, compare it against each candidate server's cached request. KV cache reuse requires the first N tokens to be identical (prefix matching). Calculate the overlap level between the new request and each server's cache.
+
+   **Match threshold:** Only consider it a meaningful cache hit if BOTH conditions are met:
+   - ≥40% of the new request's tokens overlap with the cached prefix, AND
+   - ≥3000 tokens of overlap
+
+   Below this threshold, there's no meaningful cache affinity—treat servers equally and proceed to the next tiebreaker. Above threshold, prefer the server with the highest overlap (most tokens reusable).
+
+   **Matching requirements:** For overlap to count, the requests must also match on: endpoint type, model, and relevant metaparameters (e.g., `num_ctx`).
+
+   This optimization is critical for agentic workflows ([Claude Code](https://github.com/anthropics/claude-code), [Mistral Vibe CLI](https://github.com/BigBIueWhale/mistral_vibe_setup)) where sequential API calls within the same conversation benefit enormously from KV cache reuse. Users of [openwebui_config](https://github.com/BigBIueWhale/openwebui_config) also get quicker follow-up responses when continuing a conversation. It also correctly handles OpenWebUI where different users' conversations are distinguishable by content despite sharing the same source IP.
+
+8. **Speed tiebreaker:** From remaining candidates (from step 7—servers in the same capability tier with model X hot, KV cache compatible, and conversation affinity applied), prefer the **fastest server**. Speed values are embedded in the server string (e.g., `--server "http://192.168.1.10:11434=Server-A[speed=100]"`, `--server "http://192.168.1.12:11434=Server-C[speed=100]"`). Servers without explicit speed annotation default to speed 0 (baseline/normal). Higher speed values are preferred over lower speed values.
 
 9. **Fallback (CLI order):** From any remaining tied candidates (from step 8), choose the first server in CLI argument order (deterministic).
 
@@ -657,51 +674,61 @@ CLI args:
   --kv-q8 qwen3-32b
 
 Initial state:
-  ServerA: KV cache owner = None
-  ServerB: KV cache owner = None
-  ServerC: KV cache owner = None
+  ServerA: cached_request = None
+  ServerB: cached_request = None
+  ServerC: cached_request = None
 
-Request from 192.168.1.50: model=qwen3-32b
+Request: model=qwen3-32b, messages=[user:"Hello", asst:"Hi!", user:"Explain KV cache"]  (5000 tokens)
 1. Availability: ServerA (not busy), ServerB (not busy), ServerC (busy) → [ServerA, ServerB]
 2. Model installed: All have qwen3-32b → [ServerA, ServerB]
 3. Reliability: All are Reliable → [ServerA, ServerB]
 4. Capability: Prefer lowest tier (capability 10) → [ServerA, ServerB]
 5. KV cache type: All are q8_0 (compatible) → [ServerA, ServerB]
 6. Hot model: Both have qwen3-32b loaded → [ServerA, ServerB]
-7. User affinity: 192.168.1.50 owns neither; both unowned (equal) → [ServerA, ServerB]
+7. Conversation affinity: No cached requests anywhere → [ServerA, ServerB]
 8. Speed: ServerA speed=100, ServerB speed=0 → [ServerA]
-9. Fallback: Not needed
 → ServerA selected
-→ After completion: ServerA.owner = 192.168.1.50
+→ After completion: ServerA.cached_request = [user:"Hello", asst:"Hi!", user:"Explain KV cache", asst:"...response..."]
 
-Request from 192.168.1.51: model=qwen3-32b
-1. Availability: ServerA (not busy), ServerB (not busy) → [ServerA, ServerB]
-2-6. (same filtering) → [ServerA, ServerB]
-7. User affinity: 192.168.1.51 owns neither. ServerA owned by 192.168.1.50, ServerB unowned.
-   Prefer unowned → [ServerB]
-→ ServerB selected
-→ After completion: ServerB.owner = 192.168.1.51
-
-Request from 192.168.1.50: model=qwen3-32b (second request, agentic workflow)
+Request: model=qwen3-32b, messages=[user:"What's the weather?"]  (100 tokens, different conversation)
 1-6. → [ServerA, ServerB]
-7. User affinity: 192.168.1.50 owns ServerA's cache! → [ServerA]
-→ ServerA selected (KV cache reused—instant prompt ingestion)
+7. Conversation affinity: Compare with ServerA's cache—0% overlap (completely different).
+   No meaningful match. Both servers equal → [ServerA, ServerB]
+8. Speed: ServerA speed=100 → [ServerA]
+→ ServerA selected (overwrites cache, unavoidable)
+→ After completion: ServerA.cached_request = [user:"What's the weather?", asst:"...response..."]
 
-Request from 192.168.1.52: model=qwen3-32b (new user)
+Request: model=qwen3-32b, messages=[user:"Hello", asst:"Hi!", user:"Explain KV cache", asst:"...", user:"Give example"]  (6000 tokens, continuing first conversation!)
 1-6. → [ServerA, ServerB]
-7. User affinity: 192.168.1.52 owns neither. ServerA owned 10:00:00, ServerB owned 10:00:05.
-   Prefer older ownership → [ServerA]
-8. Speed: Only one candidate → ServerA selected
-→ After completion: ServerA.owner = 192.168.1.52 (overwrites 192.168.1.50's ownership)
+7. Conversation affinity:
+   - ServerA cache: [user:"What's the weather?", ...] — 0% overlap, no match
+   - ServerB cache: None
+   No server has matching prefix → [ServerA, ServerB]
+8. Speed: → [ServerA]
+→ ServerA selected (unfortunately first conversation's cache was overwritten)
 
-Request from 192.168.1.50: model=qwen3-32b (returning user, but cache was stolen)
+Request (OpenWebUI scenario—all from same proxy IP 10.0.0.5):
+  User Alice: model=qwen3-32b, messages=[user:"Help with Python", asst:"Sure!", user:"Show loops"]  (4000 tokens)
 1-6. → [ServerA, ServerB]
-7. User affinity: 192.168.1.50 owns neither anymore. ServerA owned by .52 (newer), ServerB by .51 (older).
-   Prefer older → [ServerB]
-→ ServerB selected (must re-ingest prompt, but that's unavoidable—cache was overwritten)
-→ After completion: ServerB.owner = 192.168.1.50
+7. Conversation affinity: ServerA has weather convo cached, 0% overlap → no match
+→ ServerB selected (unowned)
+→ After completion: ServerB.cached_request = Alice's Python conversation
 
-Request: model=gpt-oss:20b (from any user)
+  User Bob: model=qwen3-32b, messages=[user:"Explain Docker"]  (500 tokens)
+1-6. → [ServerA, ServerB]
+7. Conversation affinity: Neither cache matches Bob's new conversation → [ServerA, ServerB]
+8. Speed: → [ServerA]
+→ ServerA selected
+
+  User Alice continues: messages=[..prev.., asst:"...", user:"Now show while loops"]  (5500 tokens)
+1-6. → [ServerA, ServerB]
+7. Conversation affinity:
+   - ServerB cache: Alice's Python convo. Overlap = 4000/5500 = 73%, AND >3000 tokens. MATCH!
+   - ServerA cache: Bob's Docker convo. 0% overlap.
+   → [ServerB] (significant cache hit!)
+→ ServerB selected (KV cache reused—only new tokens processed, instant response)
+
+Request: model=gpt-oss:20b (any conversation)
 1. Availability: ServerA (busy), ServerB (not busy), ServerC (not busy) → [ServerB, ServerC]
 2. Model installed: Only ServerC has gpt-oss:20b → [ServerC]
 3-9. Only one candidate throughout → ServerC selected
@@ -716,11 +743,11 @@ Request: model=gpt-oss:20b (from any user)
 
 #### Implementation Notes
 - **Background polling threads** per server (30-60s intervals for `/api/tags` and `/api/ps`, 10-30s for `/health`)
-- **In-memory cluster state:** installed models per server, loaded models per server, KV cache type per server, capability tier per server, speed tier per server, KV cache owner (IP + timestamp + model) per server
+- **In-memory cluster state:** installed models per server, loaded models per server, KV cache type per server, capability tier per server, speed tier per server, cached request per server (messages/prompt + model + endpoint + metaparameters + timestamp)
 - **Intercept `GET /api/tags` and `GET /v1/models`:** Respond directly with aggregated data (union of all models across all servers) instead of proxying to random server
 - **Parse inference requests:** Extract `model` field from JSON body of `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions` requests—these are the only endpoints that establish/invalidate KV cache ownership
-- **User affinity tracking:** On successful inference completion (stream ends without error in `ResponseBodyWithGuard`), record `(owner_ip, timestamp, model)` for that server. Ownership persists until overwritten by another user's inference request.
-- **Filter candidates before selection:** Apply the 9-step sequential hierarchy: availability → model availability → reliability → capability tier → KV cache compatibility → hot model → user affinity → speed → CLI order fallback
+- **Conversation affinity tracking:** On successful inference completion (stream ends without error in `ResponseBodyWithGuard`), store the full request data for that server: `(messages/prompt, model, endpoint, metaparameters, timestamp)`. This cached request is compared against incoming requests to calculate prefix overlap. Cache persists until overwritten by the next inference request on that server.
+- **Filter candidates before selection:** Apply the 9-step sequential hierarchy: availability → model availability → reliability → capability tier → KV cache compatibility → hot model → conversation affinity → speed → CLI order fallback
 - **Continue using runtime failure tracking:** Inference failures demote servers to `Unreliable` regardless of API health status
 - **CLI arguments:** New format: `--server "URL=NAME[capability=0-100,speed=0-100]"` where capability and speed are optional parameters embedded in the server string (both default to 0 if omitted). `--kv-q8 <model-name>` flag (repeatable) to specify models requiring 8-bit KV cache quantization. It's highly recommended to place the highest amount of servers at the lowest capability tier, because if you have (for example) only one server at the lowest capability tier, that's likely to cause that same poor low-tiered server to be converted back and forth between `KV_CACHE_TYPE` and models being constantly unloaded to switch models. This low tier is designed to serve the masses, to relieve the load- so take that into account.
 - **Configurable bind address:** Add `--bind <IP:PORT>` CLI argument. The current hard-coded `0.0.0.0:11434` should become configurable. Default should be `127.0.0.1:11434` for security, with `0.0.0.0:11434` for network-wide access.
