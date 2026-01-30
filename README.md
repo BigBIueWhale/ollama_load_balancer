@@ -190,6 +190,8 @@ That's what `SecondChanceGiven` is for. It's a state that we can flip to ensure 
 ## Supported Usages
 We support `continue.dev` and also any client that streams responses from an Ollama server such as https://openwebui.com/
 
+**Important for Mistral Vibe CLI users:** If experiencing 10-30 second delays after every tool call, upgrade Ollama to v0.14.0+ — see [KV Cache Bug Investigation](https://github.com/BigBIueWhale/vibe_web_terminal/tree/master/doc/ollama_kv_cache_bug_investigation.md) for details.
+
 We support `/api/chat`, `/api/generate` (CTRL+i in `continue.dev`), `/api/show`, and actually we support any POST request. We support streaming based on `Transfer-Encoding: chunked` and `Content-Type: application/x-ndjson`.
 
 Static HTTP is also supported with `stream: false` in JSON given in POST request to Ollama.
