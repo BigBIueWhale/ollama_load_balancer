@@ -741,13 +741,16 @@ Request: model=gpt-oss:20b (any conversation)
 #### API Availability
 - `/api/tags` and `/api/ps` present in Ollama since at least beginning of 2024.
 - OpenAI-compatible `GET /v1/models` added via [PR #5209](https://github.com/ollama/ollama/pull/5209) (merged July 2, 2024) and may also be leveraged for aggregation
+- **Anthropic-compatible `POST /v1/messages`** added in Ollama ~0.15.x (July 2025)—must be treated as inference endpoint for model-aware routing
+- **OpenAI Responses API `POST /v1/responses`** added in Ollama ~0.15.x (June 2025)—must be treated as inference endpoint
+- **Image generation endpoints** `POST /v1/images/generations` and `POST /v1/images/edits` added experimentally—may need special handling for very long timeouts
 - [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows) control APIs (`GET :11435/health`, `POST :11435/set-kv-cache`) are custom to that deployment method (December 29, 2025+)
 
 #### Implementation Notes
 - **Background polling threads** per server (30-60s intervals for `/api/tags` and `/api/ps`, 10-30s for `/health`)
 - **In-memory cluster state:** installed models per server, loaded models per server, KV cache type per server, capability tier per server, speed tier per server, cached request per server (messages/prompt + model + endpoint + metaparameters + timestamp)
 - **Intercept `GET /api/tags` and `GET /v1/models`:** Respond directly with aggregated data (union of all models across all servers) instead of proxying to random server
-- **Parse inference requests:** Extract `model` field from JSON body of `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions` requests—these are the only endpoints that establish/invalidate KV cache ownership
+- **Parse inference requests:** Extract `model` field from JSON body of inference endpoints: `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages` (Anthropic), `/v1/images/generations`, `/v1/images/edits`. These endpoints establish/invalidate KV cache ownership. Note: Image generation endpoints use different request format and don't benefit from KV cache affinity.
 - **Conversation affinity tracking:** On successful inference completion (stream ends without error in `ResponseBodyWithGuard`), store the full request data for that server: `(messages/prompt, model, endpoint, metaparameters, timestamp)`. This cached request is compared against incoming requests to calculate prefix overlap. Cache persists until overwritten by the next inference request on that server.
 - **Filter candidates before selection:** Apply the 9-step sequential hierarchy: availability → model availability → reliability → capability tier → KV cache compatibility → hot model → conversation affinity → speed → CLI order fallback
 - **Continue using runtime failure tracking:** Inference failures demote servers to `Unreliable` regardless of API health status
@@ -1162,20 +1165,18 @@ This approach is ideal for:
 - Performance testing with real streaming responses
 - Validating behavior under concurrent load from multiple clients
 
-### Automated Testing with Ollama Simulator (Planned)
+### Automated Testing with Ollama Simulator
 
-The [Ollama API observation document](./test/ollama_observation/README.md) contains detailed documentation of Ollama's HTTP API behavior captured from Ollama version 0.13.5. This includes:
+The [Ollama simulator](./test/ollama_simulator/) provides automated testing without requiring real GPU hardware or Ollama installations.
 
-- Exact response formats, headers, and timing characteristics for all endpoints
-- Streaming formats (NDJSON for native API, SSE for OpenAI-compatible API)
-- Error responses and edge cases
-- Token generation timing and chunk intervals
+```bash
+cd test/ollama_simulator
+cargo run --release --bin load_balancer_test
+```
 
-**Future plan:** Use these observations to create an **Ollama simulator**—a mock server that accurately replicates Ollama's behavior without requiring GPU hardware or actual model inference. This will enable:
+The test suite validates 11 scenarios including basic routing, load balancing, failure handling, server recovery, streaming responses, and KV cache prefix matching. See [test/ollama_simulator/README.md](./test/ollama_simulator/README.md) for details.
 
-- Fast, deterministic automated tests that run in CI/CD pipelines
-- Testing of edge cases (timeouts, mid-stream failures, server crashes) that are difficult to reproduce with real servers
-- Validation of the v1.0.4 model-aware routing logic without needing multiple physical servers
+The simulator implements core Ollama endpoints (`/api/chat`, `/api/generate`, `/api/tags`, `/api/ps`, `/api/version`) with configurable behaviors (Normal, Hang, FailMidStream, Slow, HttpError, etc.) and realistic KV cache simulation for testing conversation affinity routing.
 
 ## Research
 

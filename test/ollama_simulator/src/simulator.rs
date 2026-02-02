@@ -108,12 +108,16 @@ async fn handle_ollama_request(
             handle_root(behavior).await
         }
         // Version
-        (Method::GET, "/api/version") => {
+        (Method::GET, "/api/version") | (Method::HEAD, "/api/version") => {
             handle_version(behavior).await
         }
         // List models
-        (Method::GET, "/api/tags") => {
+        (Method::GET, "/api/tags") | (Method::HEAD, "/api/tags") => {
             handle_tags(state, port, behavior).await
+        }
+        // Show model info
+        (Method::POST, "/api/show") => {
+            handle_show(req, state, port, behavior).await
         }
         // List loaded models
         (Method::GET, "/api/ps") => {
@@ -133,6 +137,10 @@ async fn handle_ollama_request(
         }
         (Method::POST, "/v1/chat/completions") => {
             handle_v1_chat_completions(req, state, port, behavior).await
+        }
+        // Anthropic compatible endpoint
+        (Method::POST, "/v1/messages") => {
+            handle_v1_messages(req, state, port, behavior).await
         }
         // Catch all
         _ => {
@@ -227,6 +235,99 @@ async fn handle_tags(
         .header("Content-Type", "application/json; charset=utf-8")
         .body(Body::from(json))
         .unwrap())
+}
+
+async fn handle_show(
+    req: Request<Body>,
+    state: Arc<RwLock<SimulatorState>>,
+    port: u16,
+    behavior: ServerBehavior,
+) -> Result<Response<Body>, Infallible> {
+    if let ServerBehavior::Hang = behavior {
+        loop {
+            sleep(Duration::from_secs(3600)).await;
+        }
+    }
+
+    // Parse request to get model name
+    let body = match hyper::body::to_bytes(req.into_body()).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!("Failed to read request body: {}", e)))
+                .unwrap());
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct ShowRequest {
+        model: String,
+        #[serde(default)]
+        verbose: bool,
+    }
+
+    let show_req: ShowRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!(r#"{{"error":"Invalid request: {}"}}"#, e)))
+                .unwrap());
+        }
+    };
+
+    let state = state.read().await;
+    let server = match state.servers.get(&port) {
+        Some(s) => s,
+        None => {
+            return Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("Server not found"))
+                .unwrap());
+        }
+    };
+
+    // Find the model
+    let model = server.installed_models.iter()
+        .find(|m| m.name == show_req.model || m.name.starts_with(&format!("{}:", show_req.model)));
+
+    match model {
+        Some(m) => {
+            let response = serde_json::json!({
+                "modelfile": format!("# Modelfile for {}\nFROM {}", m.name, m.name),
+                "parameters": "num_ctx 4096\ntemperature 0.7",
+                "template": "{{ .Prompt }}",
+                "details": {
+                    "parent_model": "",
+                    "format": "gguf",
+                    "family": m.family,
+                    "families": [m.family],
+                    "parameter_size": m.parameter_size,
+                    "quantization_level": m.quantization_level
+                },
+                "model_info": {},
+                "capabilities": ["completion"]
+            });
+            let json = serde_json::to_string(&response).unwrap();
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json; charset=utf-8")
+                .body(Body::from(json))
+                .unwrap())
+        }
+        None => {
+            let error = OllamaErrorResponse {
+                error: format!("model '{}' not found", show_req.model),
+            };
+            let json = serde_json::to_string(&error).unwrap();
+            Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("Content-Type", "application/json; charset=utf-8")
+                .body(Body::from(json))
+                .unwrap())
+        }
+    }
 }
 
 async fn handle_ps(
@@ -775,7 +876,47 @@ async fn handle_v1_chat_completions(
                     .unwrap());
             }
         }
+        ServerBehavior::Hang => {
+            loop {
+                sleep(Duration::from_secs(3600)).await;
+            }
+        }
+        ServerBehavior::HttpError { status_code, ref message } => {
+            let error = serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "server_error",
+                    "code": status_code
+                }
+            });
+            return Ok(Response::builder()
+                .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&error).unwrap()))
+                .unwrap());
+        }
+        ServerBehavior::Slow { tokens_per_sec, num_tokens: slow_num_tokens } => {
+            let tokens = slow_num_tokens;
+            if stream {
+                let chunks = generate_v1_streaming_chunks(&model_name, tokens, tokens_per_sec, 0);
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "text/event-stream")
+                    .header("Transfer-Encoding", "chunked")
+                    .body(Body::wrap_stream(chunks))
+                    .unwrap());
+            } else {
+                let response = generate_v1_non_streaming_response(&model_name, tokens);
+                let json = serde_json::to_string(&response).unwrap();
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json))
+                    .unwrap());
+            }
+        }
         _ => {
+            // Default: return a normal response for unhandled behaviors
             let response = generate_v1_non_streaming_response(&model_name, num_tokens);
             let json = serde_json::to_string(&response).unwrap();
             return Ok(Response::builder()
@@ -785,6 +926,120 @@ async fn handle_v1_chat_completions(
                 .unwrap());
         }
     }
+}
+
+/// Handle Anthropic-compatible /v1/messages endpoint
+async fn handle_v1_messages(
+    req: Request<Body>,
+    state: Arc<RwLock<SimulatorState>>,
+    port: u16,
+    behavior: ServerBehavior,
+) -> Result<Response<Body>, Infallible> {
+    // Parse request
+    let body = match hyper::body::to_bytes(req.into_body()).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!("Failed to read request body: {}", e)))
+                .unwrap());
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct AnthropicRequest {
+        model: String,
+        #[serde(default)]
+        stream: Option<bool>,
+        #[serde(default)]
+        max_tokens: Option<usize>,
+    }
+
+    let anthropic_req: AnthropicRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/json")
+                .body(Body::from(format!(r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"{}"}}}}"#, e)))
+                .unwrap());
+        }
+    };
+
+    // Mark model as loaded
+    {
+        let mut state_guard = state.write().await;
+        if let Some(server) = state_guard.servers.get_mut(&port) {
+            server.loaded_model = Some(anthropic_req.model.clone());
+        }
+    }
+
+    let stream = anthropic_req.stream.unwrap_or(false);
+    let num_tokens = anthropic_req.max_tokens.unwrap_or(20);
+    let model_name = anthropic_req.model;
+
+    match behavior {
+        ServerBehavior::Hang => {
+            loop {
+                sleep(Duration::from_secs(3600)).await;
+            }
+        }
+        ServerBehavior::HttpError { status_code, ref message } => {
+            let error = serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": message
+                }
+            });
+            return Ok(Response::builder()
+                .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&error).unwrap()))
+                .unwrap());
+        }
+        _ => {
+            // Return Anthropic-style response
+            if stream {
+                // Streaming not fully implemented - return non-streaming
+                let response = generate_anthropic_response(&model_name, num_tokens);
+                let json = serde_json::to_string(&response).unwrap();
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json))
+                    .unwrap());
+            } else {
+                let response = generate_anthropic_response(&model_name, num_tokens);
+                let json = serde_json::to_string(&response).unwrap();
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json))
+                    .unwrap());
+            }
+        }
+    }
+}
+
+/// Generate Anthropic-style response
+fn generate_anthropic_response(model: &str, num_tokens: usize) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("msg_{}", uuid::Uuid::new_v4().to_string().chars().take(24).collect::<String>()),
+        "type": "message",
+        "role": "assistant",
+        "content": [{
+            "type": "text",
+            "text": "Hello! I'm a helpful AI assistant."
+        }],
+        "model": model,
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": num_tokens
+        }
+    })
 }
 
 /// Generate streaming response chunks for /api/chat (legacy, for Slow behavior)
