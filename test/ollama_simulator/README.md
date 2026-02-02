@@ -1,0 +1,308 @@
+# Ollama Simulator
+
+A Rust-based Ollama server simulator for automated testing of `ollama_load_balancer`.
+
+## Overview
+
+This package provides:
+
+1. **Ollama Simulator** (`ollama_simulator`) - Mock Ollama servers with programmatic behavior control
+2. **Test Runner** (`load_balancer_test`) - Automated test suite for the load balancer
+
+## Prerequisites
+
+Build the load balancer first:
+
+```bash
+cd /path/to/ollama_load_balancer
+cargo build --release
+```
+
+## Running the Tests
+
+```bash
+cd test/ollama_simulator
+cargo run --release --bin load_balancer_test
+```
+
+Expected output:
+
+```
+======================================
+  Ollama Load Balancer Test Suite
+======================================
+
+[+] Basic single server request
+[+] Load balancing across multiple servers
+[+] Server unreachable - marked as unreliable
+[+] Server fails mid-stream
+[+] Server recovery from unreliable to reliable
+[+] All servers busy - queue or reject
+[+] Second chance mechanism for unreliable servers
+[+] No available servers response
+[+] GET requests (non-POST)
+[+] Streaming response timing
+
+Total: 10 passed, 0 failed
+```
+
+## Running the Simulator Standalone
+
+For manual testing or development:
+
+```bash
+cargo run --bin ollama_simulator -- --control-port 11500 --server-ports 11501,11502,11503
+```
+
+This starts:
+- Control API on port 11500
+- Three simulated Ollama servers on ports 11501, 11502, 11503
+
+## Control API
+
+The simulator exposes a control API for programmatically changing server behavior:
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/status` | GET | Get status of all simulated servers |
+| `/behavior` | POST | Set behavior for a server |
+| `/models` | POST | Set installed models |
+| `/reset` | POST | Reset all servers to default state |
+| `/health` | GET | Health check |
+
+### Setting Server Behavior
+
+```bash
+# Make server on port 11501 hang (simulate timeout)
+curl -X POST http://127.0.0.1:11500/behavior \
+  -H "Content-Type: application/json" \
+  -d '{"port": 11501, "behavior": {"type": "Hang"}}'
+
+# Make server fail mid-stream after 5 tokens
+curl -X POST http://127.0.0.1:11500/behavior \
+  -H "Content-Type: application/json" \
+  -d '{"port": 11501, "behavior": {"type": "FailMidStream", "tokens_before_fail": 5, "tokens_per_sec": 50.0}}'
+
+# Reset to normal behavior
+curl -X POST http://127.0.0.1:11500/behavior \
+  -H "Content-Type: application/json" \
+  -d '{"port": 11501, "behavior": {"type": "Normal", "tokens_per_sec": 70.0, "num_tokens": 20, "load_delay_ms": 0}}'
+
+# Apply behavior to all servers
+curl -X POST http://127.0.0.1:11500/behavior \
+  -H "Content-Type: application/json" \
+  -d '{"port": {"all": true}, "behavior": {"type": "Normal"}}'
+```
+
+### Available Behaviors
+
+| Behavior | Description |
+|----------|-------------|
+| `Normal` | Normal operation with configurable generation/prompt eval rates |
+| `Hang` | Accept connection but never respond |
+| `FailMidStream` | Send partial response then fail |
+| `TimeoutAfterHeaders` | Send headers then hang |
+| `Slow` | Very slow token generation |
+| `HttpError` | Return specific HTTP error code |
+| `ModelNotFound` | Return 404 for model |
+| `ConnectionRefused` | Simulate connection refused |
+| `AbruptClose` | Close connection after partial data |
+| `Custom` | Custom response body/status |
+
+## Test Scenarios
+
+The test suite validates:
+
+1. **Basic single server request** - Simple request/response
+2. **Load balancing** - Concurrent requests distributed across servers
+3. **Server unreachable** - Timeout handling and unreliable marking
+4. **Mid-stream failure** - Recovery from streaming errors
+5. **Server recovery** - Transition from unreliable back to reliable
+6. **All servers busy** - 503 response when no servers available
+7. **Second chance mechanism** - Unreliable servers get retry opportunities
+8. **No available servers** - Graceful handling when all servers fail
+9. **GET requests** - Non-POST endpoints (`/api/tags`, `/api/version`, `/`)
+10. **Streaming response** - NDJSON streaming with proper termination
+11. **KV cache prefix matching** - Cached prompts have faster TTFT
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Test Runner                              │
+│  (starts/stops load balancer, sends requests, validates)    │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   Load Balancer                              │
+│              (http://127.0.0.1:11434)                       │
+└─────────────────────────────────────────────────────────────┘
+                              │
+          ┌───────────────────┼───────────────────┐
+          ▼                   ▼                   ▼
+┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│ Simulated       │ │ Simulated       │ │ Simulated       │
+│ Ollama :11501   │ │ Ollama :11502   │ │ Ollama :11503   │
+└─────────────────┘ └─────────────────┘ └─────────────────┘
+          │                   │                   │
+          └───────────────────┴───────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Control API                               │
+│              (http://127.0.0.1:11500)                       │
+│         (changes server behavior during tests)              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Simulated Ollama Endpoints
+
+The simulator implements these Ollama API endpoints:
+
+- `GET /` - Health check ("Ollama is running")
+- `GET /api/version` - Version info
+- `GET /api/tags` - List installed models
+- `GET /api/ps` - List loaded models
+- `POST /api/chat` - Chat completion (streaming/non-streaming)
+- `POST /api/generate` - Text generation
+- `GET /v1/models` - OpenAI-compatible models list
+- `POST /v1/chat/completions` - OpenAI-compatible chat
+
+## KV Cache Simulation
+
+Each simulated server maintains its own KV cache state, mimicking real Ollama behavior where cached prompt prefixes speed up subsequent requests.
+
+### Timing Model
+
+| Phase | Default Rate | Notes |
+|-------|-------------|-------|
+| Prompt eval (uncached) | 2900 tok/s | RTX 5090 with qwen3-32b |
+| Prompt eval (cached) | Instant | Prefix match from KV cache |
+| Token generation | 65 tok/s | Output token rate |
+
+### Prefix Matching
+
+When a request arrives, the simulator:
+1. Tokenizes the prompt (simple word/punctuation splitting)
+2. Compares with cached tokens from previous request
+3. Calculates delay only for uncached (new) tokens
+4. Updates cache with full context (prompt + response)
+
+### Control API
+
+```bash
+# View KV cache state for server on port 11501
+curl http://127.0.0.1:11500/kv-cache/11501
+
+# Clear KV cache for a specific server
+curl -X POST http://127.0.0.1:11500/kv-cache/clear \
+  -H "Content-Type: application/json" \
+  -d '{"port": 11501}'
+
+# Clear KV cache for all servers
+curl -X POST http://127.0.0.1:11500/kv-cache/clear \
+  -H "Content-Type: application/json" \
+  -d '{"port": {"all": true}}'
+```
+
+### Configuring Timing
+
+```bash
+# Set custom prompt eval and generation rates
+curl -X POST http://127.0.0.1:11500/behavior \
+  -H "Content-Type: application/json" \
+  -d '{
+    "port": 11501,
+    "behavior": {
+      "type": "Normal",
+      "tokens_per_sec": 65.0,
+      "prompt_eval_tokens_per_sec": 2900.0,
+      "num_tokens": 20,
+      "load_delay_ms": 0
+    }
+  }'
+```
+
+## Per-Server Configuration
+
+Each simulated server maintains independent state, enabling heterogeneous cluster testing:
+
+```bash
+# Configure Server A with qwen3-32b only
+curl -X POST http://127.0.0.1:11500/models -d '{
+  "port": 11501,
+  "models": [{"name": "qwen3-32b", "size": 20000000000, "digest": "abc...",
+              "family": "qwen3", "parameter_size": "32.8B", "quantization_level": "Q4_K_M"}]
+}'
+
+# Configure Server B with gpt-oss:20b only
+curl -X POST http://127.0.0.1:11500/models -d '{
+  "port": 11502,
+  "models": [{"name": "gpt-oss:20b", "size": 12000000000, "digest": "def...",
+              "family": "gpt", "parameter_size": "20B", "quantization_level": "Q4_K_M"}]
+}'
+
+# Set which model is "hot" (loaded in VRAM) on Server A
+curl -X POST http://127.0.0.1:11500/loaded-model -d '{
+  "port": 11501,
+  "model": "qwen3-32b"
+}'
+```
+
+This enables testing:
+- Model-aware routing (v1.0.4)
+- Hot model preference
+- Heterogeneous server configurations
+
+## Platform Support
+
+The simulator is cross-platform and works on:
+- Linux
+- macOS
+- Windows 10/11
+
+On Windows, process termination uses `child.kill()` instead of Unix SIGTERM, but functionality is equivalent for testing purposes.
+
+## Extending for v1.0.4
+
+The infrastructure supports future extensions for testing v1.0.4 features with [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows) compatibility.
+
+### Production vs Test Architecture
+
+In production, each physical server runs:
+- Ollama on port **11434**
+- llm_server_windows KV Cache API on port **11435**
+
+For testing on `127.0.0.1`, use offset ports per simulated server:
+
+| Server | Ollama Port | KV Cache API Port |
+|--------|-------------|-------------------|
+| Server A | 11501 | 11601 |
+| Server B | 11502 | 11602 |
+| Server C | 11503 | 11603 |
+
+This allows the load balancer to query both endpoints at the same "logical" server.
+
+### llm_server_windows API
+
+`llm_server_windows` exposes:
+
+| Endpoint | Method | Response |
+|----------|--------|----------|
+| `/health` | GET | `{"status": "healthy", "ollama_running": true, "kv_cache_type": "q8_0"}` |
+| `/set-kv-cache` | POST | `202 Accepted` (triggers Ollama restart, 5-15s downtime) |
+
+### Implementation Plan
+
+| Extension | How to Add |
+|-----------|-----------|
+| KV cache API ports | Add `--kv-api-ports 11601,11602,11603` CLI flag |
+| `/health` endpoint | Return `{"status": "healthy", "ollama_running": true, "kv_cache_type": "<config>"}` |
+| `/set-kv-cache` endpoint | Accept `{"type": "q8_0"}` or `{"type": "q16"}`, update state, trigger restart |
+| Restart simulation | Set behavior to `TimeoutAfterHeaders` for 5-15s, then auto-resume `Normal` |
+| Load balancer config | `--server=http://127.0.0.1:11501 --kv-api=http://127.0.0.1:11601` |
+
+The per-server state model (`SimulatedServerState`) already supports independent configuration of models, loaded state, KV cache, and behavior per server.

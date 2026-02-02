@@ -1,0 +1,40 @@
+[package]
+name = "ollama_simulator"
+version = "0.1.0"
+edition = "2021"
+description = "Accurate Ollama simulator for automated testing of ollama_load_balancer"
+
+[[bin]]
+name = "ollama_simulator"
+path = "src/main.rs"
+
+[[bin]]
+name = "load_balancer_test"
+path = "src/test_runner.rs"
+
+[dependencies]
+# HTTP server framework
+hyper = { version = "0.14", features = ["full"] }
+tokio = { version = "1", features = ["full", "sync", "time", "process", "signal"] }
+futures-util = "0.3"
+bytes = "1"
+
+# JSON handling
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP client for testing
+reqwest = { version = "0.12", features = ["stream", "json"] }
+
+# Unique identifiers
+uuid = { version = "1", features = ["v4"] }
+
+# Time handling
+chrono = "0.4"
+
+# Random number generation
+rand = "0.8"
+
+# Unix signal handling
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
