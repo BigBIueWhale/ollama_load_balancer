@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "load_balancer_test"
 path = "src/test_runner.rs"
 
+[[bin]]
+name = "freeze_server"
+path = "src/freeze_server.rs"
+
 [dependencies]
 # HTTP server framework
 hyper = { version = "0.14", features = ["full"] }
@@ -41,3 +45,9 @@ urlencoding = "2"
 # Unix signal handling
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+nix = { version = "0.28", features = ["signal", "process"] }
+
+# Cross-platform socket options (for SO_LINGER to send RST)
+[dependencies.socket2]
+version = "0.5"
+features = ["all"]
