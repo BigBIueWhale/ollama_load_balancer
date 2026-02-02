@@ -212,12 +212,22 @@ On Windows, process termination uses `child.kill()` instead of Unix SIGTERM, but
 
 ## Extending for v1.0.4
 
-The infrastructure supports future extensions for testing v1.0.4 features:
+The infrastructure supports future extensions for testing v1.0.4 features with [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows) compatibility.
+
+`llm_server_windows` exposes a KV Cache Control API on port **11435** (separate from Ollama on 11434):
+
+| Endpoint | Method | Response |
+|----------|--------|----------|
+| `/health` | GET | `{"status": "healthy", "ollama_running": true, "kv_cache_type": "q8_0"}` |
+| `/set-kv-cache` | POST | `202 Accepted` (triggers Ollama restart, 5-15s downtime) |
+
+To simulate this in the test framework:
 
 | Extension | How to Add |
 |-----------|-----------|
-| `llm_server_windows` health endpoint | Add `/health` route returning `{"kv_cache_type": "q8_0"}` |
-| KV cache reconfiguration | Add `/set-kv-cache` route with configurable restart delay |
-| Restart simulation | Use `TimeoutAfterHeaders` behavior during simulated restart |
+| KV cache control port | Add secondary HTTP listener on port 11435 per simulated server |
+| `/health` endpoint | Return `{"status": "healthy", "ollama_running": true, "kv_cache_type": "<config>"}` |
+| `/set-kv-cache` endpoint | Accept `{"type": "q8_0"}` or `{"type": "q16"}`, trigger simulated restart |
+| Restart simulation | Use `TimeoutAfterHeaders` behavior for 5-15s, then resume `Normal` |
 
 The per-server state model (`SimulatedServerState`) already supports independent configuration of models, loaded state, and behavior per server.
