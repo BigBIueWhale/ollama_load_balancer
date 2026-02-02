@@ -1174,7 +1174,7 @@ cd test/ollama_simulator
 cargo run --release --bin load_balancer_test
 ```
 
-The test suite validates 12 scenarios including basic routing, load balancing, failure handling, server recovery, streaming responses, KV cache prefix matching, and embeddings endpoints. See [test/ollama_simulator/README.md](./test/ollama_simulator/README.md) for details.
+The test suite validates 15 scenarios including basic routing, load balancing, failure handling, server recovery, streaming responses, KV cache prefix matching, embeddings endpoints, and TCP shutdown behavior (radio silence via SIGSTOP, RST, graceful FIN). See [test/ollama_simulator/README.md](./test/ollama_simulator/README.md) for details.
 
 The simulator implements Ollama endpoints (`/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/ps`, `/api/version`, `/api/show`) and compatibility layers (`/v1/chat/completions`, `/v1/embeddings`, `/v1/models`, `/v1/messages`) with configurable behaviors and realistic KV cache simulation.
 
