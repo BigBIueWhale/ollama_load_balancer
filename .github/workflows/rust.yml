@@ -48,13 +48,14 @@ jobs:
       run: cargo build --release --verbose
 
     - name: Build test binaries
-      run: cargo build --release -p ollama_simulator --verbose
+      run: cargo build --release --verbose
+      working-directory: ./test/ollama_simulator
 
     - name: Run unit tests
       run: cargo test --verbose
 
     - name: Run integration tests
-      run: cargo run --release --bin load_balancer_test
+      run: ./target/release/load_balancer_test
       working-directory: ./test/ollama_simulator
 
   # Note for Windows users:
