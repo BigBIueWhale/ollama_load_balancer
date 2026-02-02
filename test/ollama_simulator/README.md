@@ -43,8 +43,9 @@ Expected output:
 [+] GET requests (non-POST)
 [+] Streaming response timing
 [+] KV cache prefix matching
+[+] Embeddings endpoints
 
-Total: 11 passed, 0 failed
+Total: 12 passed, 0 failed
 ```
 
 ## Running the Simulator Standalone
@@ -174,11 +175,15 @@ The simulator implements these Ollama API endpoints:
 - `GET /api/ps` - List loaded models
 - `POST /api/chat` - Chat completion (streaming/non-streaming) **with KV cache simulation**
 - `POST /api/generate` - Text generation (no KV cache simulation)
+- `POST /api/embed` - Generate embeddings (new, supports batch input)
+- `POST /api/embeddings` - Generate embeddings (deprecated, single input)
 - `GET /v1/models` - OpenAI-compatible models list
+- `GET /v1/models/:model` - OpenAI-compatible specific model info
+- `POST /v1/embeddings` - OpenAI-compatible embeddings
 - `POST /v1/chat/completions` - OpenAI-compatible chat
 - `POST /v1/messages` - Anthropic-compatible messages API
 
-> **Note:** KV cache simulation only applies to `/api/chat`. The `/api/generate` endpoint does not track or benefit from cached context.
+> **Note:** KV cache simulation only applies to `/api/chat`. The `/api/generate` and embedding endpoints do not track or benefit from cached context.
 
 ## KV Cache Simulation
 

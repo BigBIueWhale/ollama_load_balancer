@@ -750,7 +750,7 @@ Request: model=gpt-oss:20b (any conversation)
 - **Background polling threads** per server (30-60s intervals for `/api/tags` and `/api/ps`, 10-30s for `/health`)
 - **In-memory cluster state:** installed models per server, loaded models per server, KV cache type per server, capability tier per server, speed tier per server, cached request per server (messages/prompt + model + endpoint + metaparameters + timestamp)
 - **Intercept `GET /api/tags` and `GET /v1/models`:** Respond directly with aggregated data (union of all models across all servers) instead of proxying to random server
-- **Parse inference requests:** Extract `model` field from JSON body of inference endpoints: `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages` (Anthropic), `/v1/images/generations`, `/v1/images/edits`. These endpoints establish/invalidate KV cache ownership. Note: Image generation endpoints use different request format and don't benefit from KV cache affinity.
+- **Parse inference requests:** Extract `model` field from JSON body of inference endpoints: `/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/responses`, `/v1/messages` (Anthropic), `/v1/images/generations`, `/v1/images/edits`. Text generation endpoints (`/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`) establish/invalidate KV cache ownership. Embedding and image generation endpoints load models but don't benefit from KV cache affinity.
 - **Conversation affinity tracking:** On successful inference completion (stream ends without error in `ResponseBodyWithGuard`), store the full request data for that server: `(messages/prompt, model, endpoint, metaparameters, timestamp)`. This cached request is compared against incoming requests to calculate prefix overlap. Cache persists until overwritten by the next inference request on that server.
 - **Filter candidates before selection:** Apply the 9-step sequential hierarchy: availability → model availability → reliability → capability tier → KV cache compatibility → hot model → conversation affinity → speed → CLI order fallback
 - **Continue using runtime failure tracking:** Inference failures demote servers to `Unreliable` regardless of API health status
@@ -1174,9 +1174,9 @@ cd test/ollama_simulator
 cargo run --release --bin load_balancer_test
 ```
 
-The test suite validates 11 scenarios including basic routing, load balancing, failure handling, server recovery, streaming responses, and KV cache prefix matching. See [test/ollama_simulator/README.md](./test/ollama_simulator/README.md) for details.
+The test suite validates 12 scenarios including basic routing, load balancing, failure handling, server recovery, streaming responses, KV cache prefix matching, and embeddings endpoints. See [test/ollama_simulator/README.md](./test/ollama_simulator/README.md) for details.
 
-The simulator implements core Ollama endpoints (`/api/chat`, `/api/generate`, `/api/tags`, `/api/ps`, `/api/version`) with configurable behaviors (Normal, Hang, FailMidStream, Slow, HttpError, etc.) and realistic KV cache simulation for testing conversation affinity routing.
+The simulator implements Ollama endpoints (`/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/ps`, `/api/version`, `/api/show`) and compatibility layers (`/v1/chat/completions`, `/v1/embeddings`, `/v1/models`, `/v1/messages`) with configurable behaviors and realistic KV cache simulation.
 
 ## Research
 
