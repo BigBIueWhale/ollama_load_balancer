@@ -35,6 +35,9 @@ chrono = "0.4"
 # Random number generation
 rand = "0.8"
 
+# URL encoding/decoding
+urlencoding = "2"
+
 # Unix signal handling
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

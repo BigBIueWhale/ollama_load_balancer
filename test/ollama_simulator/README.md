@@ -42,8 +42,10 @@ Expected output:
 [+] No available servers response
 [+] GET requests (non-POST)
 [+] Streaming response timing
+[+] KV cache prefix matching
+[+] Embeddings endpoints
 
-Total: 10 passed, 0 failed
+Total: 12 passed, 0 failed
 ```
 
 ## Running the Simulator Standalone
@@ -68,8 +70,12 @@ The simulator exposes a control API for programmatically changing server behavio
 |----------|--------|-------------|
 | `/status` | GET | Get status of all simulated servers |
 | `/behavior` | POST | Set behavior for a server |
-| `/models` | POST | Set installed models |
+| `/models` | POST | Set installed models for a server |
+| `/loaded-model` | POST | Set which model is "hot" (loaded in VRAM) |
 | `/reset` | POST | Reset all servers to default state |
+| `/request-count/{port}` | GET | Get request counter for a server |
+| `/kv-cache/{port}` | GET | Get KV cache tokens for a server |
+| `/kv-cache/clear` | POST | Clear KV cache for server(s) |
 | `/health` | GET | Health check |
 
 ### Setting Server Behavior
@@ -162,14 +168,22 @@ The test suite validates:
 
 The simulator implements these Ollama API endpoints:
 
-- `GET /` - Health check ("Ollama is running")
-- `GET /api/version` - Version info
-- `GET /api/tags` - List installed models
+- `GET /`, `HEAD /` - Health check ("Ollama is running")
+- `GET /api/version`, `HEAD /api/version` - Version info
+- `GET /api/tags`, `HEAD /api/tags` - List installed models
+- `POST /api/show` - Show model information
 - `GET /api/ps` - List loaded models
-- `POST /api/chat` - Chat completion (streaming/non-streaming)
-- `POST /api/generate` - Text generation
+- `POST /api/chat` - Chat completion (streaming/non-streaming) **with KV cache simulation**
+- `POST /api/generate` - Text generation (no KV cache simulation)
+- `POST /api/embed` - Generate embeddings (new, supports batch input)
+- `POST /api/embeddings` - Generate embeddings (deprecated, single input)
 - `GET /v1/models` - OpenAI-compatible models list
+- `GET /v1/models/:model` - OpenAI-compatible specific model info
+- `POST /v1/embeddings` - OpenAI-compatible embeddings
 - `POST /v1/chat/completions` - OpenAI-compatible chat
+- `POST /v1/messages` - Anthropic-compatible messages API
+
+> **Note:** KV cache simulation only applies to `/api/chat`. The `/api/generate` and embedding endpoints do not track or benefit from cached context.
 
 ## KV Cache Simulation
 
@@ -266,43 +280,13 @@ The simulator is cross-platform and works on:
 
 On Windows, process termination uses `child.kill()` instead of Unix SIGTERM, but functionality is equivalent for testing purposes.
 
-## Extending for v1.0.4
+## Future: v1.0.4 Testing Support
 
-The infrastructure supports future extensions for testing v1.0.4 features with [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows) compatibility.
+The simulator infrastructure is designed to support v1.0.4 features. See the [main README's v1.0.4 section](../../README.md#vision-for-version-104) for the full roadmap including:
 
-### Production vs Test Architecture
+- Model-aware routing and capability tiers
+- [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows) KV cache API simulation (ports 11601-11603)
+- Dynamic KV cache type switching (`q8_0`/`q16`)
+- Conversation affinity routing
 
-In production, each physical server runs:
-- Ollama on port **11434**
-- llm_server_windows KV Cache API on port **11435**
-
-For testing on `127.0.0.1`, use offset ports per simulated server:
-
-| Server | Ollama Port | KV Cache API Port |
-|--------|-------------|-------------------|
-| Server A | 11501 | 11601 |
-| Server B | 11502 | 11602 |
-| Server C | 11503 | 11603 |
-
-This allows the load balancer to query both endpoints at the same "logical" server.
-
-### llm_server_windows API
-
-`llm_server_windows` exposes:
-
-| Endpoint | Method | Response |
-|----------|--------|----------|
-| `/health` | GET | `{"status": "healthy", "ollama_running": true, "kv_cache_type": "q8_0"}` |
-| `/set-kv-cache` | POST | `202 Accepted` (triggers Ollama restart, 5-15s downtime) |
-
-### Implementation Plan
-
-| Extension | How to Add |
-|-----------|-----------|
-| KV cache API ports | Add `--kv-api-ports 11601,11602,11603` CLI flag |
-| `/health` endpoint | Return `{"status": "healthy", "ollama_running": true, "kv_cache_type": "<config>"}` |
-| `/set-kv-cache` endpoint | Accept `{"type": "q8_0"}` or `{"type": "q16"}`, update state, trigger restart |
-| Restart simulation | Set behavior to `TimeoutAfterHeaders` for 5-15s, then auto-resume `Normal` |
-| Load balancer config | `--server=http://127.0.0.1:11501 --kv-api=http://127.0.0.1:11601` |
-
-The per-server state model (`SimulatedServerState`) already supports independent configuration of models, loaded state, KV cache, and behavior per server.
+The per-server state model (`SimulatedServerState`) already supports independent configuration of models, loaded state, KV cache, and behavior per server—ready for these extensions.

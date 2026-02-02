@@ -126,6 +126,9 @@ async fn run_tests() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Test 11: KV cache prefix matching
     results.push(test_kv_cache_prefix_matching(&config, state.clone()).await);
 
+    // Test 12: Embeddings endpoints
+    results.push(test_embeddings(&config, state.clone()).await);
+
     let total_duration = test_start.elapsed();
 
     // Print results
@@ -1196,6 +1199,173 @@ async fn test_kv_cache_prefix_matching(
             ).into())
         }
     }.await;
+
+    let error_message = match &result {
+        Ok(()) => String::new(),
+        Err(e) => e.to_string(),
+    };
+    TestResult {
+        name,
+        passed: result.is_ok(),
+        message: error_message,
+        duration_ms: start.elapsed().as_millis() as u64,
+    }
+}
+
+/// Test 12: Embeddings endpoints (new /api/embed, deprecated /api/embeddings, OpenAI /v1/embeddings)
+async fn test_embeddings(
+    config: &TestConfig,
+    state: Arc<RwLock<SimulatorState>>,
+) -> TestResult {
+    let name = "Embeddings endpoints".to_string();
+    let start = std::time::Instant::now();
+
+    // Reset state
+    {
+        let mut state = state.write().await;
+        for server in state.servers.values_mut() {
+            server.behavior = ServerBehavior::Normal {
+                tokens_per_sec: 65.0,
+                prompt_eval_tokens_per_sec: 2900.0,
+                num_tokens: 20,
+                load_delay_ms: 0,
+            };
+        }
+    }
+
+    let mut lb = match start_load_balancer(config).await {
+        Ok(lb) => lb,
+        Err(e) => {
+            return TestResult {
+                name,
+                passed: false,
+                message: e.to_string(),
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+    };
+
+    let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+        let client = reqwest::Client::new();
+
+        // Test 1: New /api/embed endpoint with single input
+        let embed_response = client
+            .post(&format!("http://127.0.0.1:{}/api/embed", config.load_balancer_port))
+            .json(&serde_json::json!({
+                "model": "test-model:latest",
+                "input": "Hello world"
+            }))
+            .send()
+            .await?;
+
+        if !embed_response.status().is_success() {
+            return Err(format!("/api/embed failed: {}", embed_response.status()).into());
+        }
+
+        let embed_json: serde_json::Value = embed_response.json().await?;
+
+        // Verify response format: { "embeddings": [[...]], "model": "..." }
+        if embed_json.get("embeddings").is_none() {
+            return Err("Missing 'embeddings' field in /api/embed response".into());
+        }
+        let embeddings = embed_json["embeddings"].as_array()
+            .ok_or("'embeddings' is not an array")?;
+        if embeddings.is_empty() {
+            return Err("Empty embeddings array".into());
+        }
+        let first_embedding = embeddings[0].as_array()
+            .ok_or("First embedding is not an array")?;
+        if first_embedding.is_empty() {
+            return Err("First embedding is empty".into());
+        }
+
+        // Test 2: New /api/embed endpoint with batch input
+        let batch_response = client
+            .post(&format!("http://127.0.0.1:{}/api/embed", config.load_balancer_port))
+            .json(&serde_json::json!({
+                "model": "test-model:latest",
+                "input": ["Hello world", "How are you?"]
+            }))
+            .send()
+            .await?;
+
+        if !batch_response.status().is_success() {
+            return Err(format!("/api/embed batch failed: {}", batch_response.status()).into());
+        }
+
+        let batch_json: serde_json::Value = batch_response.json().await?;
+        let batch_embeddings = batch_json["embeddings"].as_array()
+            .ok_or("Batch 'embeddings' is not an array")?;
+        if batch_embeddings.len() != 2 {
+            return Err(format!("Expected 2 embeddings, got {}", batch_embeddings.len()).into());
+        }
+
+        // Test 3: Deprecated /api/embeddings endpoint
+        let old_response = client
+            .post(&format!("http://127.0.0.1:{}/api/embeddings", config.load_balancer_port))
+            .json(&serde_json::json!({
+                "model": "test-model:latest",
+                "prompt": "Hello world"
+            }))
+            .send()
+            .await?;
+
+        if !old_response.status().is_success() {
+            return Err(format!("/api/embeddings failed: {}", old_response.status()).into());
+        }
+
+        let old_json: serde_json::Value = old_response.json().await?;
+
+        // Verify old format: { "embedding": [...] } (singular, not array of arrays)
+        if old_json.get("embedding").is_none() {
+            return Err("Missing 'embedding' field in /api/embeddings response".into());
+        }
+        let old_embedding = old_json["embedding"].as_array()
+            .ok_or("'embedding' is not an array")?;
+        if old_embedding.is_empty() {
+            return Err("Old embedding is empty".into());
+        }
+
+        // Test 4: OpenAI-compatible /v1/embeddings endpoint
+        let v1_response = client
+            .post(&format!("http://127.0.0.1:{}/v1/embeddings", config.load_balancer_port))
+            .json(&serde_json::json!({
+                "model": "test-model:latest",
+                "input": ["Hello world", "How are you?"]
+            }))
+            .send()
+            .await?;
+
+        if !v1_response.status().is_success() {
+            return Err(format!("/v1/embeddings failed: {}", v1_response.status()).into());
+        }
+
+        let v1_json: serde_json::Value = v1_response.json().await?;
+
+        // Verify OpenAI format: { "object": "list", "data": [{ "embedding": [...], "index": 0 }, ...] }
+        if v1_json.get("object").and_then(|v| v.as_str()) != Some("list") {
+            return Err("Missing or wrong 'object' field in /v1/embeddings response".into());
+        }
+        let v1_data = v1_json["data"].as_array()
+            .ok_or("'data' is not an array in /v1/embeddings response")?;
+        if v1_data.len() != 2 {
+            return Err(format!("Expected 2 items in data, got {}", v1_data.len()).into());
+        }
+
+        // Check first item has embedding and index
+        let first_item = &v1_data[0];
+        if first_item.get("embedding").is_none() {
+            return Err("Missing 'embedding' in /v1/embeddings data item".into());
+        }
+        if first_item.get("index").is_none() {
+            return Err("Missing 'index' in /v1/embeddings data item".into());
+        }
+
+        Ok(())
+    }.await;
+
+    // Stop load balancer
+    let _ = lb.kill();
 
     let error_message = match &result {
         Ok(()) => String::new(),

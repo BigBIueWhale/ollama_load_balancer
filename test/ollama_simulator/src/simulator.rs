@@ -108,12 +108,16 @@ async fn handle_ollama_request(
             handle_root(behavior).await
         }
         // Version
-        (Method::GET, "/api/version") => {
+        (Method::GET, "/api/version") | (Method::HEAD, "/api/version") => {
             handle_version(behavior).await
         }
         // List models
-        (Method::GET, "/api/tags") => {
+        (Method::GET, "/api/tags") | (Method::HEAD, "/api/tags") => {
             handle_tags(state, port, behavior).await
+        }
+        // Show model info
+        (Method::POST, "/api/show") => {
+            handle_show(req, state, port, behavior).await
         }
         // List loaded models
         (Method::GET, "/api/ps") => {
@@ -127,12 +131,33 @@ async fn handle_ollama_request(
         (Method::POST, "/api/generate") => {
             handle_generate(req, state, port, behavior).await
         }
+        // Embeddings (new)
+        (Method::POST, "/api/embed") => {
+            handle_embed(req, state, port, behavior).await
+        }
+        // Embeddings (deprecated)
+        (Method::POST, "/api/embeddings") => {
+            handle_embeddings(req, state, port, behavior).await
+        }
         // OpenAI compatible endpoints
         (Method::GET, "/v1/models") => {
             handle_v1_models(state, port, behavior).await
         }
+        // OpenAI specific model info (with path parameter)
+        (Method::GET, path) if path.starts_with("/v1/models/") => {
+            let model_name = path.strip_prefix("/v1/models/").unwrap_or("");
+            handle_v1_models_model(model_name, state, port, behavior).await
+        }
+        // OpenAI embeddings
+        (Method::POST, "/v1/embeddings") => {
+            handle_v1_embeddings(req, state, port, behavior).await
+        }
         (Method::POST, "/v1/chat/completions") => {
             handle_v1_chat_completions(req, state, port, behavior).await
+        }
+        // Anthropic compatible endpoint
+        (Method::POST, "/v1/messages") => {
+            handle_v1_messages(req, state, port, behavior).await
         }
         // Catch all
         _ => {
@@ -227,6 +252,99 @@ async fn handle_tags(
         .header("Content-Type", "application/json; charset=utf-8")
         .body(Body::from(json))
         .unwrap())
+}
+
+async fn handle_show(
+    req: Request<Body>,
+    state: Arc<RwLock<SimulatorState>>,
+    port: u16,
+    behavior: ServerBehavior,
+) -> Result<Response<Body>, Infallible> {
+    if let ServerBehavior::Hang = behavior {
+        loop {
+            sleep(Duration::from_secs(3600)).await;
+        }
+    }
+
+    // Parse request to get model name
+    let body = match hyper::body::to_bytes(req.into_body()).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!("Failed to read request body: {}", e)))
+                .unwrap());
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct ShowRequest {
+        model: String,
+        #[serde(default)]
+        verbose: bool,
+    }
+
+    let show_req: ShowRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!(r#"{{"error":"Invalid request: {}"}}"#, e)))
+                .unwrap());
+        }
+    };
+
+    let state = state.read().await;
+    let server = match state.servers.get(&port) {
+        Some(s) => s,
+        None => {
+            return Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("Server not found"))
+                .unwrap());
+        }
+    };
+
+    // Find the model
+    let model = server.installed_models.iter()
+        .find(|m| m.name == show_req.model || m.name.starts_with(&format!("{}:", show_req.model)));
+
+    match model {
+        Some(m) => {
+            let response = serde_json::json!({
+                "modelfile": format!("# Modelfile for {}\nFROM {}", m.name, m.name),
+                "parameters": "num_ctx 4096\ntemperature 0.7",
+                "template": "{{ .Prompt }}",
+                "details": {
+                    "parent_model": "",
+                    "format": "gguf",
+                    "family": m.family,
+                    "families": [m.family],
+                    "parameter_size": m.parameter_size,
+                    "quantization_level": m.quantization_level
+                },
+                "model_info": {},
+                "capabilities": ["completion"]
+            });
+            let json = serde_json::to_string(&response).unwrap();
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json; charset=utf-8")
+                .body(Body::from(json))
+                .unwrap())
+        }
+        None => {
+            let error = OllamaErrorResponse {
+                error: format!("model '{}' not found", show_req.model),
+            };
+            let json = serde_json::to_string(&error).unwrap();
+            Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("Content-Type", "application/json; charset=utf-8")
+                .body(Body::from(json))
+                .unwrap())
+        }
+    }
 }
 
 async fn handle_ps(
@@ -775,7 +893,47 @@ async fn handle_v1_chat_completions(
                     .unwrap());
             }
         }
+        ServerBehavior::Hang => {
+            loop {
+                sleep(Duration::from_secs(3600)).await;
+            }
+        }
+        ServerBehavior::HttpError { status_code, ref message } => {
+            let error = serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "server_error",
+                    "code": status_code
+                }
+            });
+            return Ok(Response::builder()
+                .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&error).unwrap()))
+                .unwrap());
+        }
+        ServerBehavior::Slow { tokens_per_sec, num_tokens: slow_num_tokens } => {
+            let tokens = slow_num_tokens;
+            if stream {
+                let chunks = generate_v1_streaming_chunks(&model_name, tokens, tokens_per_sec, 0);
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "text/event-stream")
+                    .header("Transfer-Encoding", "chunked")
+                    .body(Body::wrap_stream(chunks))
+                    .unwrap());
+            } else {
+                let response = generate_v1_non_streaming_response(&model_name, tokens);
+                let json = serde_json::to_string(&response).unwrap();
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json))
+                    .unwrap());
+            }
+        }
         _ => {
+            // Default: return a normal response for unhandled behaviors
             let response = generate_v1_non_streaming_response(&model_name, num_tokens);
             let json = serde_json::to_string(&response).unwrap();
             return Ok(Response::builder()
@@ -783,6 +941,432 @@ async fn handle_v1_chat_completions(
                 .header("Content-Type", "application/json")
                 .body(Body::from(json))
                 .unwrap());
+        }
+    }
+}
+
+/// Handle Anthropic-compatible /v1/messages endpoint
+async fn handle_v1_messages(
+    req: Request<Body>,
+    state: Arc<RwLock<SimulatorState>>,
+    port: u16,
+    behavior: ServerBehavior,
+) -> Result<Response<Body>, Infallible> {
+    // Parse request
+    let body = match hyper::body::to_bytes(req.into_body()).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!("Failed to read request body: {}", e)))
+                .unwrap());
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct AnthropicRequest {
+        model: String,
+        #[serde(default)]
+        stream: Option<bool>,
+        #[serde(default)]
+        max_tokens: Option<usize>,
+    }
+
+    let anthropic_req: AnthropicRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/json")
+                .body(Body::from(format!(r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"{}"}}}}"#, e)))
+                .unwrap());
+        }
+    };
+
+    // Mark model as loaded
+    {
+        let mut state_guard = state.write().await;
+        if let Some(server) = state_guard.servers.get_mut(&port) {
+            server.loaded_model = Some(anthropic_req.model.clone());
+        }
+    }
+
+    let stream = anthropic_req.stream.unwrap_or(false);
+    let num_tokens = anthropic_req.max_tokens.unwrap_or(20);
+    let model_name = anthropic_req.model;
+
+    match behavior {
+        ServerBehavior::Hang => {
+            loop {
+                sleep(Duration::from_secs(3600)).await;
+            }
+        }
+        ServerBehavior::HttpError { status_code, ref message } => {
+            let error = serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": message
+                }
+            });
+            return Ok(Response::builder()
+                .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&error).unwrap()))
+                .unwrap());
+        }
+        _ => {
+            // Return Anthropic-style response
+            if stream {
+                // Streaming not fully implemented - return non-streaming
+                let response = generate_anthropic_response(&model_name, num_tokens);
+                let json = serde_json::to_string(&response).unwrap();
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json))
+                    .unwrap());
+            } else {
+                let response = generate_anthropic_response(&model_name, num_tokens);
+                let json = serde_json::to_string(&response).unwrap();
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json))
+                    .unwrap());
+            }
+        }
+    }
+}
+
+/// Generate Anthropic-style response
+fn generate_anthropic_response(model: &str, num_tokens: usize) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("msg_{}", uuid::Uuid::new_v4().to_string().chars().take(24).collect::<String>()),
+        "type": "message",
+        "role": "assistant",
+        "content": [{
+            "type": "text",
+            "text": "Hello! I'm a helpful AI assistant."
+        }],
+        "model": model,
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": num_tokens
+        }
+    })
+}
+
+/// Handle new embeddings endpoint POST /api/embed
+async fn handle_embed(
+    req: Request<Body>,
+    state: Arc<RwLock<SimulatorState>>,
+    port: u16,
+    behavior: ServerBehavior,
+) -> Result<Response<Body>, Infallible> {
+    if let ServerBehavior::Hang = behavior {
+        loop {
+            sleep(Duration::from_secs(3600)).await;
+        }
+    }
+
+    let body = match hyper::body::to_bytes(req.into_body()).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!("Failed to read request body: {}", e)))
+                .unwrap());
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct EmbedRequest {
+        model: String,
+        input: serde_json::Value, // Can be string or array of strings
+        #[serde(default)]
+        dimensions: Option<usize>,
+    }
+
+    let embed_req: EmbedRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/json")
+                .body(Body::from(format!(r#"{{"error":"Invalid request: {}"}}"#, e)))
+                .unwrap());
+        }
+    };
+
+    // Mark model as loaded
+    {
+        let mut state_guard = state.write().await;
+        if let Some(server) = state_guard.servers.get_mut(&port) {
+            server.loaded_model = Some(embed_req.model.clone());
+        }
+    }
+
+    // Parse input - can be single string or array of strings
+    let inputs: Vec<String> = match embed_req.input {
+        serde_json::Value::String(s) => vec![s],
+        serde_json::Value::Array(arr) => arr
+            .into_iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        _ => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"error":"input must be string or array of strings"}"#))
+                .unwrap());
+        }
+    };
+
+    // Generate fake embeddings
+    let dim = embed_req.dimensions.unwrap_or(384);
+    let embeddings: Vec<Vec<f32>> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            // Generate deterministic fake embedding based on index
+            (0..dim).map(|j| ((i + j) as f32 * 0.001).sin()).collect()
+        })
+        .collect();
+
+    let response = serde_json::json!({
+        "model": embed_req.model,
+        "embeddings": embeddings,
+        "total_duration": 14143917_u64,
+        "load_duration": 1019500_u64,
+        "prompt_eval_count": inputs.iter().map(|s| s.split_whitespace().count()).sum::<usize>()
+    });
+
+    let json = serde_json::to_string(&response).unwrap();
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json; charset=utf-8")
+        .body(Body::from(json))
+        .unwrap())
+}
+
+/// Handle deprecated embeddings endpoint POST /api/embeddings
+async fn handle_embeddings(
+    req: Request<Body>,
+    state: Arc<RwLock<SimulatorState>>,
+    port: u16,
+    behavior: ServerBehavior,
+) -> Result<Response<Body>, Infallible> {
+    if let ServerBehavior::Hang = behavior {
+        loop {
+            sleep(Duration::from_secs(3600)).await;
+        }
+    }
+
+    let body = match hyper::body::to_bytes(req.into_body()).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!("Failed to read request body: {}", e)))
+                .unwrap());
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct EmbeddingsRequest {
+        model: String,
+        prompt: String,
+    }
+
+    let embed_req: EmbeddingsRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/json")
+                .body(Body::from(format!(r#"{{"error":"Invalid request: {}"}}"#, e)))
+                .unwrap());
+        }
+    };
+
+    // Mark model as loaded
+    {
+        let mut state_guard = state.write().await;
+        if let Some(server) = state_guard.servers.get_mut(&port) {
+            server.loaded_model = Some(embed_req.model.clone());
+        }
+    }
+
+    // Generate fake embedding (384 dimensions is common for small models)
+    let embedding: Vec<f64> = (0..384).map(|i| (i as f64 * 0.001).sin()).collect();
+
+    let response = serde_json::json!({
+        "embedding": embedding
+    });
+
+    let json = serde_json::to_string(&response).unwrap();
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json; charset=utf-8")
+        .body(Body::from(json))
+        .unwrap())
+}
+
+/// Handle OpenAI-compatible embeddings endpoint POST /v1/embeddings
+async fn handle_v1_embeddings(
+    req: Request<Body>,
+    state: Arc<RwLock<SimulatorState>>,
+    port: u16,
+    behavior: ServerBehavior,
+) -> Result<Response<Body>, Infallible> {
+    if let ServerBehavior::Hang = behavior {
+        loop {
+            sleep(Duration::from_secs(3600)).await;
+        }
+    }
+
+    let body = match hyper::body::to_bytes(req.into_body()).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!("Failed to read request body: {}", e)))
+                .unwrap());
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct V1EmbeddingsRequest {
+        model: String,
+        input: serde_json::Value, // Can be string or array
+        #[serde(default)]
+        dimensions: Option<usize>,
+    }
+
+    let embed_req: V1EmbeddingsRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/json")
+                .body(Body::from(format!(r#"{{"error":{{"message":"{}","type":"invalid_request_error"}}}}"#, e)))
+                .unwrap());
+        }
+    };
+
+    // Mark model as loaded
+    {
+        let mut state_guard = state.write().await;
+        if let Some(server) = state_guard.servers.get_mut(&port) {
+            server.loaded_model = Some(embed_req.model.clone());
+        }
+    }
+
+    // Parse input
+    let inputs: Vec<String> = match embed_req.input {
+        serde_json::Value::String(s) => vec![s],
+        serde_json::Value::Array(arr) => arr
+            .into_iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        _ => vec!["".to_string()],
+    };
+
+    let dim = embed_req.dimensions.unwrap_or(384);
+    let data: Vec<serde_json::Value> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let embedding: Vec<f32> = (0..dim).map(|j| ((i + j) as f32 * 0.001).sin()).collect();
+            serde_json::json!({
+                "object": "embedding",
+                "embedding": embedding,
+                "index": i
+            })
+        })
+        .collect();
+
+    let response = serde_json::json!({
+        "object": "list",
+        "data": data,
+        "model": embed_req.model,
+        "usage": {
+            "prompt_tokens": inputs.iter().map(|s| s.split_whitespace().count()).sum::<usize>(),
+            "total_tokens": inputs.iter().map(|s| s.split_whitespace().count()).sum::<usize>()
+        }
+    });
+
+    let json = serde_json::to_string(&response).unwrap();
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(Body::from(json))
+        .unwrap())
+}
+
+/// Handle OpenAI-compatible specific model info GET /v1/models/:model
+async fn handle_v1_models_model(
+    model_name: &str,
+    state: Arc<RwLock<SimulatorState>>,
+    port: u16,
+    behavior: ServerBehavior,
+) -> Result<Response<Body>, Infallible> {
+    if let ServerBehavior::Hang = behavior {
+        loop {
+            sleep(Duration::from_secs(3600)).await;
+        }
+    }
+
+    let state = state.read().await;
+    let server = match state.servers.get(&port) {
+        Some(s) => s,
+        None => {
+            return Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("Server not found"))
+                .unwrap());
+        }
+    };
+
+    // URL decode the model name
+    let model_name = urlencoding::decode(model_name).unwrap_or_else(|_| model_name.into());
+
+    // Find the model
+    let model = server.installed_models.iter()
+        .find(|m| m.name == model_name.as_ref() || m.name.starts_with(&format!("{}:", model_name)));
+
+    match model {
+        Some(m) => {
+            let response = serde_json::json!({
+                "id": m.name,
+                "object": "model",
+                "created": Utc::now().timestamp(),
+                "owned_by": "library"
+            });
+            let json = serde_json::to_string(&response).unwrap();
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .body(Body::from(json))
+                .unwrap())
+        }
+        None => {
+            let error = serde_json::json!({
+                "error": {
+                    "message": format!("The model '{}' does not exist", model_name),
+                    "type": "invalid_request_error",
+                    "code": "model_not_found"
+                }
+            });
+            let json = serde_json::to_string(&error).unwrap();
+            Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("Content-Type", "application/json")
+                .body(Body::from(json))
+                .unwrap())
         }
     }
 }
