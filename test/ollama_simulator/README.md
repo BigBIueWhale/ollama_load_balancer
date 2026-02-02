@@ -169,3 +169,55 @@ The simulator implements these Ollama API endpoints:
 - `POST /api/generate` - Text generation
 - `GET /v1/models` - OpenAI-compatible models list
 - `POST /v1/chat/completions` - OpenAI-compatible chat
+
+## Per-Server Configuration
+
+Each simulated server maintains independent state, enabling heterogeneous cluster testing:
+
+```bash
+# Configure Server A with qwen3-32b only
+curl -X POST http://127.0.0.1:11500/models -d '{
+  "port": 11501,
+  "models": [{"name": "qwen3-32b", "size": 20000000000, "digest": "abc...",
+              "family": "qwen3", "parameter_size": "32.8B", "quantization_level": "Q4_K_M"}]
+}'
+
+# Configure Server B with gpt-oss:20b only
+curl -X POST http://127.0.0.1:11500/models -d '{
+  "port": 11502,
+  "models": [{"name": "gpt-oss:20b", "size": 12000000000, "digest": "def...",
+              "family": "gpt", "parameter_size": "20B", "quantization_level": "Q4_K_M"}]
+}'
+
+# Set which model is "hot" (loaded in VRAM) on Server A
+curl -X POST http://127.0.0.1:11500/loaded-model -d '{
+  "port": 11501,
+  "model": "qwen3-32b"
+}'
+```
+
+This enables testing:
+- Model-aware routing (v1.0.4)
+- Hot model preference
+- Heterogeneous server configurations
+
+## Platform Support
+
+The simulator is cross-platform and works on:
+- Linux
+- macOS
+- Windows 10/11
+
+On Windows, process termination uses `child.kill()` instead of Unix SIGTERM, but functionality is equivalent for testing purposes.
+
+## Extending for v1.0.4
+
+The infrastructure supports future extensions for testing v1.0.4 features:
+
+| Extension | How to Add |
+|-----------|-----------|
+| `llm_server_windows` health endpoint | Add `/health` route returning `{"kv_cache_type": "q8_0"}` |
+| KV cache reconfiguration | Add `/set-kv-cache` route with configurable restart delay |
+| Restart simulation | Use `TimeoutAfterHeaders` behavior during simulated restart |
+
+The per-server state model (`SimulatedServerState`) already supports independent configuration of models, loaded state, and behavior per server.
