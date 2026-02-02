@@ -644,24 +644,28 @@ When a client requests inference with model X, the load balancer selects a serve
 
 6. **Hot model preference:** From KV-cache-compatible candidates (from step 5), prefer servers where model X is already loaded in VRAM (per `/api/ps` polling). This eliminates cold-start latency (5-60 seconds). If multiple servers have model X hot, proceed to next tiebreaker. If no servers have model X hot, choose any server from the remaining candidates (will incur cold-start). Note: This preference only applies to servers that already have the correct `KV_CACHE_TYPE`. This step is not applied when we're in the path of choosing a server to have its `KV_CACHE_TYPE` converted.
 
-7. **Conversation affinity (KV cache locality):** From candidates with hot model (from step 6), prefer the server whose cached request has significant **prefix overlap** with the incoming request.
+7. **Conversation affinity (KV cache locality):** From candidates with hot model (from step 6), prefer the server whose cached conversation is a **prefix** of the incoming request.
 
    **Why not use client IP?** Source IP is unreliable for identifying conversations:
    - **OpenWebUI/proxy scenarios:** All users' requests arrive from the same IP (the proxy server)
    - **Multi-agent workflows:** When Claude Code spawns search agents, each agent deserves its own cache affinity despite sharing source IP
    - **NAT/corporate networks:** Multiple users share a single public IP
 
-   **How it works:** Each server "owns" its most recent inference request. When a new request arrives, compare it against each candidate server's cached request. KV cache reuse requires the first N tokens to be identical (prefix matching). Calculate the overlap level between the new request and each server's cache.
+   **How KV cache works internally:** Ollama's KV cache stores token embeddings. Cache reuse requires the first N *token IDs* to be identical. The load balancer has no access to model tokenizers, so it cannot compute token-level overlap directly.
 
-   **Match threshold:** Only consider it a meaningful cache hit if BOTH conditions are met:
-   - ≥40% of the new request's tokens overlap with the cached prefix, AND
-   - ≥3000 tokens of overlap
+   **Message-level approximation:** Since template rendering and tokenization are deterministic (same model + same messages → same tokens), we compare at the **message level** instead. If `cached_messages` is a strict prefix of `new_messages`, the token prefix will match. This works because agentic clients send back the exact conversation history—the assistant's response in the new request is verbatim what the server generated.
 
-   Below this threshold, there's no meaningful cache affinity—treat servers equally and proceed to the next tiebreaker. Above threshold, prefer the server with the highest overlap (most tokens reusable).
+   **How it works:** After each successful completion, store the full conversation (input messages + generated response). On new request, check if any server's cached messages array is a **strict prefix** of the incoming messages array. Compare messages field-by-field: `role`, `content`, `images`, `tool_calls`, `thinking`, `tool_call_id`. All fields must match exactly.
 
-   **Matching requirements:** For overlap to count, the requests must also match on: endpoint type, model, and relevant metaparameters (e.g., `num_ctx`).
+   **Match requirements:** For a prefix match to count:
+   - `model` must match exactly
+   - `tools` array must match (tool definitions are rendered into the prompt for some models)
+   - `options.num_ctx` must match (affects context window/truncation)
+   - Cached messages must be a strict prefix of new messages (element-by-element equality)
 
-   This optimization is critical for agentic workflows ([Claude Code](https://github.com/anthropics/claude-code), [Mistral Vibe CLI](https://github.com/BigBIueWhale/mistral_vibe_setup)) where sequential API calls within the same conversation benefit enormously from KV cache reuse. Users of [openwebui_config](https://github.com/BigBIueWhale/openwebui_config) also get quicker follow-up responses when continuing a conversation. It also correctly handles OpenWebUI where different users' conversations are distinguishable by content despite sharing the same source IP.
+   **Threshold:** Only consider it a meaningful cache hit if the cached prefix covers ≥40% of the new request's messages AND ≥3 messages. Below this threshold, treat servers equally.
+
+   This optimization is critical for agentic workflows ([Claude Code](https://github.com/anthropics/claude-code), [Mistral Vibe CLI](https://github.com/BigBIueWhale/mistral_vibe_setup)) where sequential API calls benefit enormously from KV cache reuse. It also correctly handles OpenWebUI where different users' conversations are distinguishable by content despite sharing the same source IP.
 
 8. **Speed tiebreaker:** From remaining candidates (from step 7—servers in the same capability tier with model X hot, KV cache compatible, and conversation affinity applied), prefer the **fastest server**. Speed values are embedded in the server string (e.g., `--server "http://192.168.1.10:11434=Server-A[speed=100]"`, `--server "http://192.168.1.12:11434=Server-C[speed=100]"`). Servers without explicit speed annotation default to speed 0 (baseline/normal). Higher speed values are preferred over lower speed values.
 
@@ -680,7 +684,7 @@ Initial state:
   ServerB: cached_request = None
   ServerC: cached_request = None
 
-Request: model=qwen3-32b, messages=[user:"Hello", asst:"Hi!", user:"Explain KV cache"]  (5000 tokens)
+Request: model=qwen3-32b, messages=[user:"Hello", asst:"Hi!", user:"Explain KV cache"]  (3 messages)
 1. Availability: ServerA (not busy), ServerB (not busy), ServerC (busy) → [ServerA, ServerB]
 2. Model installed: All have qwen3-32b → [ServerA, ServerB]
 3. Reliability: All are Reliable → [ServerA, ServerB]
@@ -690,45 +694,45 @@ Request: model=qwen3-32b, messages=[user:"Hello", asst:"Hi!", user:"Explain KV c
 7. Conversation affinity: No cached requests anywhere → [ServerA, ServerB]
 8. Speed: ServerA speed=100, ServerB speed=0 → [ServerA]
 → ServerA selected
-→ After completion: ServerA.cached_request = [user:"Hello", asst:"Hi!", user:"Explain KV cache", asst:"...response..."]
+→ After completion: ServerA.cached_messages = [user:"Hello", asst:"Hi!", user:"Explain KV cache", asst:"...response..."]
 
-Request: model=qwen3-32b, messages=[user:"What's the weather?"]  (100 tokens, different conversation)
+Request: model=qwen3-32b, messages=[user:"What's the weather?"]  (1 message, different conversation)
 1-6. → [ServerA, ServerB]
-7. Conversation affinity: Compare with ServerA's cache—0% overlap (completely different).
+7. Conversation affinity: ServerA's cache is not a prefix of this request (different first message).
    No meaningful match. Both servers equal → [ServerA, ServerB]
 8. Speed: ServerA speed=100 → [ServerA]
 → ServerA selected (overwrites cache, unavoidable)
-→ After completion: ServerA.cached_request = [user:"What's the weather?", asst:"...response..."]
+→ After completion: ServerA.cached_messages = [user:"What's the weather?", asst:"...response..."]
 
-Request: model=qwen3-32b, messages=[user:"Hello", asst:"Hi!", user:"Explain KV cache", asst:"...", user:"Give example"]  (6000 tokens, continuing first conversation!)
+Request: model=qwen3-32b, messages=[user:"Hello", asst:"Hi!", user:"Explain KV cache", asst:"...", user:"Give example"]  (5 messages, continuing first conversation!)
 1-6. → [ServerA, ServerB]
 7. Conversation affinity:
-   - ServerA cache: [user:"What's the weather?", ...] — 0% overlap, no match
+   - ServerA cache: [user:"What's the weather?", ...] — not a prefix, no match
    - ServerB cache: None
    No server has matching prefix → [ServerA, ServerB]
 8. Speed: → [ServerA]
 → ServerA selected (unfortunately first conversation's cache was overwritten)
 
 Request (OpenWebUI scenario—all from same proxy IP 10.0.0.5):
-  User Alice: model=qwen3-32b, messages=[user:"Help with Python", asst:"Sure!", user:"Show loops"]  (4000 tokens)
+  User Alice: model=qwen3-32b, messages=[user:"Help with Python", asst:"Sure!", user:"Show loops"]  (3 messages)
 1-6. → [ServerA, ServerB]
-7. Conversation affinity: ServerA has weather convo cached, 0% overlap → no match
+7. Conversation affinity: ServerA's cache is not a prefix → no match
 → ServerB selected (unowned)
-→ After completion: ServerB.cached_request = Alice's Python conversation
+→ After completion: ServerB.cached_messages = [user:"Help with Python", asst:"Sure!", user:"Show loops", asst:"..."]
 
-  User Bob: model=qwen3-32b, messages=[user:"Explain Docker"]  (500 tokens)
+  User Bob: model=qwen3-32b, messages=[user:"Explain Docker"]  (1 message)
 1-6. → [ServerA, ServerB]
-7. Conversation affinity: Neither cache matches Bob's new conversation → [ServerA, ServerB]
+7. Conversation affinity: Neither cache is a prefix of Bob's new conversation → [ServerA, ServerB]
 8. Speed: → [ServerA]
 → ServerA selected
 
-  User Alice continues: messages=[..prev.., asst:"...", user:"Now show while loops"]  (5500 tokens)
+  User Alice continues: messages=[user:"Help with Python", asst:"Sure!", user:"Show loops", asst:"...", user:"Now show while loops"]  (5 messages)
 1-6. → [ServerA, ServerB]
 7. Conversation affinity:
-   - ServerB cache: Alice's Python convo. Overlap = 4000/5500 = 73%, AND >3000 tokens. MATCH!
-   - ServerA cache: Bob's Docker convo. 0% overlap.
-   → [ServerB] (significant cache hit!)
-→ ServerB selected (KV cache reused—only new tokens processed, instant response)
+   - ServerB cache: [user:"Help with Python", asst:"Sure!", user:"Show loops", asst:"..."] — IS a prefix! (4/5 = 80%, ≥3 messages). MATCH!
+   - ServerA cache: Bob's Docker convo — not a prefix.
+   → [ServerB] (cache hit!)
+→ ServerB selected (KV cache reused—only new message needs processing)
 
 Request: model=gpt-oss:20b (any conversation)
 1. Availability: ServerA (busy), ServerB (not busy), ServerC (not busy) → [ServerB, ServerC]
@@ -748,10 +752,11 @@ Request: model=gpt-oss:20b (any conversation)
 
 #### Implementation Notes
 - **Background polling threads** per server (30-60s intervals for `/api/tags` and `/api/ps`, 10-30s for `/health`)
-- **In-memory cluster state:** installed models per server, loaded models per server, KV cache type per server, capability tier per server, speed tier per server, cached request per server (messages/prompt + model + endpoint + metaparameters + timestamp)
+- **In-memory cluster state:** installed models per server, loaded models per server, KV cache type per server, capability tier per server, speed tier per server, cached conversation per server `{model, messages[], tools[], num_ctx, timestamp}`
 - **Intercept `GET /api/tags` and `GET /v1/models`:** Respond directly with aggregated data (union of all models across all servers) instead of proxying to random server
-- **Parse inference requests:** Extract `model` field from JSON body of inference endpoints: `/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/responses`, `/v1/messages` (Anthropic), `/v1/images/generations`, `/v1/images/edits`. Text generation endpoints (`/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`) establish/invalidate KV cache ownership. Embedding and image generation endpoints load models but don't benefit from KV cache affinity.
-- **Conversation affinity tracking:** On successful inference completion (stream ends without error in `ResponseBodyWithGuard`), store the full request data for that server: `(messages/prompt, model, endpoint, metaparameters, timestamp)`. This cached request is compared against incoming requests to calculate prefix overlap. Cache persists until overwritten by the next inference request on that server.
+- **Parse inference requests:** Extract `model` field from JSON body of inference endpoints: `/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/responses`, `/v1/messages` (Anthropic), `/v1/images/generations`, `/v1/images/edits`. Text generation endpoints (`/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`) establish KV cache ownership. Embedding and image generation endpoints load models but don't benefit from KV cache affinity.
+- **Conversation affinity tracking:** On successful inference completion, store the complete conversation for that server: input messages + generated response (captured from stream). Store: `{model, messages[], tools[], num_ctx, timestamp}`. On new request, check if any cached conversation is a strict prefix of the new messages. Compare messages field-by-field: `role`, `content`, `images`, `tool_calls`, `thinking`, `tool_call_id`—all must match exactly.
+- **API format normalization:** Different endpoints use different message formats (native Ollama, OpenAI, Anthropic). For cache comparison, either normalize to a common internal format or compare within the same endpoint type only. Key differences: OpenAI tool call arguments are JSON strings (native uses objects), Anthropic uses `tool_use`/`tool_result` content blocks (native uses role=tool messages), Responses API uses `function_call`/`function_call_output` items.
 - **Filter candidates before selection:** Apply the 9-step sequential hierarchy: availability → model availability → reliability → capability tier → KV cache compatibility → hot model → conversation affinity → speed → CLI order fallback
 - **Continue using runtime failure tracking:** Inference failures demote servers to `Unreliable` regardless of API health status
 - **CLI arguments:** New format: `--server "URL=NAME[capability=0-100,speed=0-100]"` where capability and speed are optional parameters embedded in the server string (both default to 0 if omitted). `--kv-q8 <model-name>` flag (repeatable) to specify models requiring 8-bit KV cache quantization. It's highly recommended to place the highest amount of servers at the lowest capability tier, because if you have (for example) only one server at the lowest capability tier, that's likely to cause that same poor low-tiered server to be converted back and forth between `KV_CACHE_TYPE` and models being constantly unloaded to switch models. This low tier is designed to serve the masses, to relieve the load- so take that into account.
