@@ -10,6 +10,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Build the main load balancer on all platforms
   build:
     strategy:
       matrix:
@@ -24,8 +25,46 @@ jobs:
       if: matrix.os == 'ubuntu-latest'
       run: sudo apt-get install -y libssl-dev
 
-    - name: Build
-      run: cargo build --verbose
+    - name: Build load balancer
+      run: cargo build --release --verbose
 
-    - name: Run tests
+  # Run tests only on Unix (Linux and macOS)
+  # Tests require POSIX signals (SIGSTOP/SIGCONT) for TCP radio silence simulation
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up dependencies for Ubuntu
+      if: matrix.os == 'ubuntu-latest'
+      run: sudo apt-get install -y libssl-dev
+
+    - name: Build load balancer
+      run: cargo build --release --verbose
+
+    - name: Build test binaries
+      run: cargo build --release -p ollama_simulator --verbose
+
+    - name: Run unit tests
       run: cargo test --verbose
+
+    - name: Run integration tests
+      run: cargo run --release --bin load_balancer_test
+      working-directory: ./test/ollama_simulator
+
+  # Note for Windows users:
+  # The test runner (load_balancer_test) does not support Windows because it uses
+  # POSIX signals (SIGSTOP/SIGCONT) to simulate true TCP radio silence scenarios
+  # (like a VM being paused with no packets sent).
+  #
+  # To add Windows support for tests, you would need to implement:
+  # 1. Process suspension via NtSuspendProcess/NtResumeProcess from ntdll.dll
+  # 2. Or use SuspendThread/ResumeThread for each thread in the target process
+  # 3. Or use DebugActiveProcess for debugging-based suspension
+  #
+  # The main ollama_load_balancer binary works on Windows - only the test runner is Unix-only.

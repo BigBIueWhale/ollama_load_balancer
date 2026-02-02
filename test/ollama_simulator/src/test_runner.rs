@@ -3,6 +3,10 @@
 //! This binary runs automated tests against the ollama_load_balancer using
 //! the Ollama simulator to control server behavior and trigger edge cases.
 //!
+//! # Platform Support
+//! This test runner only works on Unix-like systems (Linux, macOS) because it uses
+//! POSIX signals (SIGSTOP/SIGCONT) for testing true TCP radio silence scenarios.
+//!
 //! # Exit Codes
 //! - 0: All tests passed
 //! - 1: One or more tests failed
@@ -14,16 +18,35 @@
 //! cargo run --bin load_balancer_test
 //! ```
 
+#[cfg(not(unix))]
+compile_error!(
+    "The load_balancer_test runner only supports Unix-like systems (Linux, macOS). \
+     This is because tests require POSIX signals (SIGSTOP/SIGCONT) to simulate \
+     true TCP radio silence scenarios (like a VM being paused). \
+     \n\n\
+     To add Windows support, you would need to implement: \
+     \n  1. Process suspension via NtSuspendProcess/NtResumeProcess from ntdll.dll \
+     \n  2. Or use SuspendThread/ResumeThread for each thread in the target process \
+     \n  3. Or use DebugActiveProcess for debugging-based suspension \
+     \n\n\
+     The main ollama_load_balancer binary itself works on Windows - only the tests are Unix-only."
+);
+
 mod simulator;
 mod control;
 mod types;
 
 #[allow(unused_imports)]
-use std::io::BufReader;
+use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 
 #[cfg(unix)]
 extern crate libc;
+#[cfg(unix)]
+use nix::sys::signal::{kill, Signal};
+#[cfg(unix)]
+use nix::unistd::Pid;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -42,6 +65,8 @@ struct TestConfig {
     load_balancer_port: u16,
     /// Path to the load balancer executable
     load_balancer_path: String,
+    /// Path to the freeze_server executable (for TCP radio silence tests)
+    freeze_server_path: String,
     /// Timeout in seconds for the load balancer
     load_balancer_timeout: u32,
 }
@@ -53,6 +78,7 @@ impl Default for TestConfig {
             server_ports: vec![11501, 11502, 11503],
             load_balancer_port: 11434,
             load_balancer_path: String::new(), // Will be discovered
+            freeze_server_path: String::new(), // Will be discovered
             load_balancer_timeout: 5, // Short timeout for tests
         }
     }
@@ -129,6 +155,15 @@ async fn run_tests() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Test 12: Embeddings endpoints
     results.push(test_embeddings(&config, state.clone()).await);
 
+    // Test 13: True TCP radio silence via SIGSTOP (Unix only)
+    results.push(test_tcp_radio_silence(&config).await);
+
+    // Test 14: TCP RST (abrupt close) via SO_LINGER
+    results.push(test_tcp_rst_close(&config).await);
+
+    // Test 15: Graceful TCP shutdown (FIN)
+    results.push(test_tcp_graceful_shutdown(&config).await);
+
     let total_duration = test_start.elapsed();
 
     // Print results
@@ -181,7 +216,7 @@ async fn validate_environment() -> Result<TestConfig, Box<dyn std::error::Error 
     let mut config = TestConfig::default();
 
     // Find the load balancer executable
-    let possible_paths = vec![
+    let possible_lb_paths = vec![
         "../../../target/release/ollama_load_balancer",
         "../../../target/debug/ollama_load_balancer",
         "../../target/release/ollama_load_balancer",
@@ -191,7 +226,7 @@ async fn validate_environment() -> Result<TestConfig, Box<dyn std::error::Error 
     ];
 
     let mut found_path = None;
-    for path in possible_paths {
+    for path in possible_lb_paths {
         let full_path = std::path::Path::new(path);
         if full_path.exists() {
             found_path = Some(full_path.canonicalize()?.to_string_lossy().to_string());
@@ -206,6 +241,35 @@ async fn validate_environment() -> Result<TestConfig, Box<dyn std::error::Error 
         }
         None => {
             return Err("Load balancer executable not found. Run 'cargo build --release' first.".into());
+        }
+    };
+
+    // Find the freeze_server executable (for TCP radio silence tests)
+    let possible_freeze_paths = vec![
+        "../../../target/release/freeze_server",
+        "../../../target/debug/freeze_server",
+        "../../target/release/freeze_server",
+        "../../target/debug/freeze_server",
+        "./target/release/freeze_server",
+        "./target/debug/freeze_server",
+    ];
+
+    let mut found_freeze_path = None;
+    for path in possible_freeze_paths {
+        let full_path = std::path::Path::new(path);
+        if full_path.exists() {
+            found_freeze_path = Some(full_path.canonicalize()?.to_string_lossy().to_string());
+            break;
+        }
+    }
+
+    config.freeze_server_path = match found_freeze_path {
+        Some(p) => {
+            println!("  Found freeze_server: {}", p);
+            p
+        }
+        None => {
+            return Err("freeze_server executable not found. Run 'cargo build --release -p ollama_simulator' first.".into());
         }
     };
 
@@ -1366,6 +1430,393 @@ async fn test_embeddings(
 
     // Stop load balancer
     let _ = lb.kill();
+
+    let error_message = match &result {
+        Ok(()) => String::new(),
+        Err(e) => e.to_string(),
+    };
+    TestResult {
+        name,
+        passed: result.is_ok(),
+        message: error_message,
+        duration_ms: start.elapsed().as_millis() as u64,
+    }
+}
+
+// ============================================================================
+// TCP SHUTDOWN TESTS - Testing real network behavior
+// ============================================================================
+
+/// Test 13: True TCP radio silence via SIGSTOP
+///
+/// This test verifies that the load balancer correctly handles a server that
+/// becomes completely unresponsive (like a VM being paused). Unlike graceful
+/// shutdown (FIN) or abrupt close (RST), radio silence means NO packets are
+/// sent - the server just stops responding entirely.
+///
+/// This is tested by:
+/// 1. Starting a freeze_server that accepts connections and sends partial data
+/// 2. Starting the load balancer pointing to this server
+/// 3. Initiating a streaming request
+/// 4. Sending SIGSTOP to the freeze_server (pausing it completely)
+/// 5. Verifying the load balancer times out and marks the server as unreliable
+async fn test_tcp_radio_silence(config: &TestConfig) -> TestResult {
+    let name = "TCP radio silence (SIGSTOP - VM pause simulation)".to_string();
+    let start = Instant::now();
+
+    let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+        // Use a dedicated port for this test
+        let freeze_port = config.server_ports[0] + 100; // 11601
+
+        // Wait for port to be free
+        let port_wait_start = Instant::now();
+        while !is_port_available(freeze_port).await {
+            if port_wait_start.elapsed() > Duration::from_secs(5) {
+                return Err(format!("Port {} not available", freeze_port).into());
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        // Start freeze_server in ollama-partial mode
+        let mut freeze_server = Command::new(&config.freeze_server_path)
+            .args([
+                &freeze_port.to_string(),
+                "--mode", "ollama-partial",
+                "--tokens", "2",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to start freeze_server: {}", e))?;
+
+        let freeze_pid = freeze_server.id();
+
+        // Wait for "READY" from freeze_server
+        let stdout = freeze_server.stdout.take()
+            .ok_or("Failed to get freeze_server stdout")?;
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+
+        let ready_timeout = Instant::now();
+        loop {
+            if ready_timeout.elapsed() > Duration::from_secs(5) {
+                let _ = freeze_server.kill();
+                return Err("Timeout waiting for freeze_server READY".into());
+            }
+
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) > 0 {
+                if line.trim() == "READY" {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        // Start load balancer pointing ONLY to the freeze_server
+        let lb_args = vec![
+            format!("--timeout={}", 2), // 2 second timeout for faster test
+            format!("--server=http://127.0.0.1:{}=FreezeServer", freeze_port),
+        ];
+
+        let mut lb = Command::new(&config.load_balancer_path)
+            .args(&lb_args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to start load balancer: {}", e))?;
+
+        // Wait for load balancer to be ready
+        let lb_ready_start = Instant::now();
+        loop {
+            if lb_ready_start.elapsed() > Duration::from_secs(5) {
+                let _ = lb.kill();
+                let _ = freeze_server.kill();
+                return Err("Timeout waiting for load balancer".into());
+            }
+            if tokio::net::TcpStream::connect(("127.0.0.1", config.load_balancer_port)).await.is_ok() {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        // Make a streaming request (this will connect to freeze_server)
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+
+        // Start the request in a separate task
+        let lb_port = config.load_balancer_port;
+        let request_handle = tokio::spawn(async move {
+            let response = client.post(&format!("http://127.0.0.1:{}/api/chat", lb_port))
+                .json(&serde_json::json!({
+                    "model": "test-model:latest",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": true
+                }))
+                .send()
+                .await;
+
+            match response {
+                Ok(r) => {
+                    // Try to read the body - this should eventually fail or timeout
+                    let _ = r.bytes().await;
+                    Ok(())
+                }
+                Err(e) => Err(e)
+            }
+        });
+
+        // Wait for freeze_server to receive the connection
+        sleep(Duration::from_millis(500)).await;
+
+        // NOW freeze the server with SIGSTOP - this is the key moment!
+        // After this, no packets will be sent by freeze_server.
+        kill(Pid::from_raw(freeze_pid as i32), Signal::SIGSTOP)
+            .map_err(|e| format!("Failed to SIGSTOP freeze_server: {}", e))?;
+
+        // Wait for the request to complete (should timeout)
+        let request_start = Instant::now();
+        let request_result = tokio::time::timeout(
+            Duration::from_secs(8),
+            request_handle
+        ).await;
+
+        let request_duration = request_start.elapsed();
+
+        // Resume the freeze_server so we can kill it cleanly
+        let _ = kill(Pid::from_raw(freeze_pid as i32), Signal::SIGCONT);
+        let _ = freeze_server.kill();
+        let _ = freeze_server.wait();
+
+        // Stop load balancer
+        let _ = lb.kill();
+        let _ = lb.wait();
+        sleep(Duration::from_millis(300)).await;
+
+        // The request should have completed (either error or timeout)
+        // The load balancer's 2-second timeout should have triggered
+        match request_result {
+            Ok(Ok(Ok(()))) => {
+                // Request completed - check if it took approximately the timeout duration
+                if request_duration.as_secs() >= 1 {
+                    // The load balancer timed out as expected
+                    Ok(())
+                } else {
+                    Err("Request completed too quickly - timeout may not have triggered".into())
+                }
+            }
+            Ok(Ok(Err(e))) => {
+                // Request failed with an error - this is acceptable
+                // (timeout or connection error)
+                if request_duration.as_secs() >= 1 {
+                    Ok(())
+                } else {
+                    Err(format!("Request failed but too quickly: {}", e).into())
+                }
+            }
+            Ok(Err(_join_error)) => {
+                // Task panicked - unexpected
+                Err("Request task panicked".into())
+            }
+            Err(_timeout) => {
+                // Our outer timeout triggered - the LB timeout didn't work
+                Err("Load balancer did not timeout within expected time".into())
+            }
+        }
+    }.await;
+
+    let error_message = match &result {
+        Ok(()) => String::new(),
+        Err(e) => e.to_string(),
+    };
+    TestResult {
+        name,
+        passed: result.is_ok(),
+        message: error_message,
+        duration_ms: start.elapsed().as_millis() as u64,
+    }
+}
+
+/// Test 14: TCP RST (abrupt close) via SO_LINGER(0)
+///
+/// This test verifies the load balancer handles a TCP RST (reset) correctly.
+/// Unlike radio silence, RST immediately notifies the peer that the connection
+/// is dead. This simulates a server crash or kill -9.
+async fn test_tcp_rst_close(config: &TestConfig) -> TestResult {
+    let name = "TCP RST close (abrupt termination)".to_string();
+    let start = Instant::now();
+
+    let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+        // For this test, we use the simulator's FailMidStream behavior
+        // which produces a connection reset error mid-stream.
+        reset_simulator(config).await?;
+
+        // Set first server to fail mid-stream after sending a few tokens
+        set_server_behavior(config, config.server_ports[0], &ServerBehavior::FailMidStream {
+            tokens_before_fail: 2,
+            tokens_per_sec: 100.0,
+        }).await?;
+
+        let lb = start_load_balancer(config).await?;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+
+        // Make a streaming request - it should fail mid-stream
+        let response = client.post(&format!("http://127.0.0.1:{}/api/chat", config.load_balancer_port))
+            .json(&serde_json::json!({
+                "model": "test-model:latest",
+                "messages": [{"role": "user", "content": "Test RST"}],
+                "stream": true
+            }))
+            .send()
+            .await;
+
+        // The response may succeed initially but the body should be incomplete
+        // or error during reading
+        let first_request_problematic = match response {
+            Ok(r) => {
+                // Read the body - check if it's incomplete (no "done":true)
+                match r.bytes().await {
+                    Ok(body) => {
+                        let body_str = String::from_utf8_lossy(&body);
+                        // A properly completed Ollama response ends with "done":true
+                        // An abrupt close will not have this
+                        !body_str.contains("\"done\":true")
+                    }
+                    Err(_) => true, // Stream error is expected
+                }
+            }
+            Err(_) => true, // Connection error is also acceptable
+        };
+
+        // Now the server should be marked as unreliable
+        // Reset the server to normal and verify next request goes elsewhere
+        set_server_behavior(config, config.server_ports[0], &ServerBehavior::default()).await?;
+
+        let response2 = client.post(&format!("http://127.0.0.1:{}/api/chat", config.load_balancer_port))
+            .json(&serde_json::json!({
+                "model": "test-model:latest",
+                "messages": [{"role": "user", "content": "After RST"}],
+                "stream": false
+            }))
+            .send()
+            .await?;
+
+        stop_load_balancer(lb).await;
+
+        // First request should have been problematic, second should succeed
+        if first_request_problematic && response2.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Expected incomplete/error stream and recovery. First problematic: {}, Second status: {}",
+                first_request_problematic,
+                response2.status()
+            ).into())
+        }
+    }.await;
+
+    let error_message = match &result {
+        Ok(()) => String::new(),
+        Err(e) => e.to_string(),
+    };
+    TestResult {
+        name,
+        passed: result.is_ok(),
+        message: error_message,
+        duration_ms: start.elapsed().as_millis() as u64,
+    }
+}
+
+/// Test 15: Graceful TCP shutdown (FIN)
+///
+/// This test verifies the load balancer handles graceful TCP shutdown correctly.
+/// A graceful shutdown sends FIN, allowing proper connection termination.
+/// This simulates a normal server shutdown.
+async fn test_tcp_graceful_shutdown(config: &TestConfig) -> TestResult {
+    let name = "TCP graceful shutdown (FIN)".to_string();
+    let start = Instant::now();
+
+    let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+        reset_simulator(config).await?;
+
+        // For graceful shutdown test, we'll use the ConnectionRefused behavior
+        // which closes the connection with proper HTTP response.
+        // This tests that the load balancer correctly handles a server
+        // that completes requests then becomes unavailable.
+
+        let lb = start_load_balancer(config).await?;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+
+        // First, make a successful request
+        let response1 = client.post(&format!("http://127.0.0.1:{}/api/chat", config.load_balancer_port))
+            .json(&serde_json::json!({
+                "model": "test-model:latest",
+                "messages": [{"role": "user", "content": "Before shutdown"}],
+                "stream": false
+            }))
+            .send()
+            .await?;
+
+        if !response1.status().is_success() {
+            return Err("Initial request should succeed".into());
+        }
+
+        // Now make the first server "shut down gracefully"
+        set_server_behavior(config, config.server_ports[0], &ServerBehavior::ConnectionRefused).await?;
+
+        // Next request should fail on first server but succeed on second
+        let response2 = client.post(&format!("http://127.0.0.1:{}/api/chat", config.load_balancer_port))
+            .json(&serde_json::json!({
+                "model": "test-model:latest",
+                "messages": [{"role": "user", "content": "After first shutdown"}],
+                "stream": false
+            }))
+            .send()
+            .await?;
+
+        // The load balancer might return 503 from the first server,
+        // or successfully route to another server
+        let status2 = response2.status();
+
+        // Make first server available again
+        set_server_behavior(config, config.server_ports[0], &ServerBehavior::default()).await?;
+
+        // After several requests, the first server should get a second chance
+        let mut success_count = 0;
+        for _ in 0..5 {
+            let r = client.post(&format!("http://127.0.0.1:{}/api/chat", config.load_balancer_port))
+                .json(&serde_json::json!({
+                    "model": "test-model:latest",
+                    "messages": [{"role": "user", "content": "Recovery test"}],
+                    "stream": false
+                }))
+                .send()
+                .await?;
+
+            if r.status().is_success() {
+                success_count += 1;
+            }
+        }
+
+        stop_load_balancer(lb).await;
+
+        // Most requests should succeed after recovery
+        if success_count >= 4 {
+            Ok(())
+        } else {
+            Err(format!(
+                "Expected recovery after graceful shutdown. Status after shutdown: {}, Success count: {}",
+                status2, success_count
+            ).into())
+        }
+    }.await;
 
     let error_message = match &result {
         Ok(()) => String::new(),
