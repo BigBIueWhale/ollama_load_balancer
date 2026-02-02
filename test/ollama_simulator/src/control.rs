@@ -11,6 +11,8 @@
 //! - `POST /reset` - Reset all servers to default state
 //! - `GET /request-count/{port}` - Get request count for a server
 //! - `POST /cancel/{port}` - Cancel active requests on a server
+//! - `GET /kv-cache/{port}` - Get KV cache state for a server
+//! - `POST /kv-cache/clear` - Clear KV cache for a server
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -66,6 +68,11 @@ async fn handle_control_request(
             let port_str = &path["/cancel/".len()..];
             handle_cancel(port_str, state).await
         }
+        (Method::GET, path) if path.starts_with("/kv-cache/") => {
+            let port_str = &path["/kv-cache/".len()..];
+            handle_get_kv_cache(port_str, state).await
+        }
+        (Method::POST, "/kv-cache/clear") => handle_clear_kv_cache(req, state).await,
         (Method::GET, "/health") => {
             Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -239,6 +246,7 @@ async fn handle_reset(
         server.loaded_model = None;
         server.installed_models = vec![ModelInfo::default_test_model()];
         server.active_requests.clear();
+        server.kv_cache_tokens.clear();  // Clear KV cache on reset
         if request.clear_counters {
             server.request_count = 0;
         }
@@ -297,4 +305,71 @@ async fn handle_cancel(
             .body(Body::from(format!("Server on port {} not found", port)))
             .unwrap())
     }
+}
+
+async fn handle_get_kv_cache(
+    port_str: &str,
+    state: Arc<RwLock<SimulatorState>>,
+) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
+    let port: u16 = port_str.parse()?;
+    let state = state.read().await;
+
+    if let Some(server) = state.servers.get(&port) {
+        let cache_info = serde_json::json!({
+            "port": port,
+            "token_count": server.kv_cache_tokens.len(),
+            "tokens": server.kv_cache_tokens,
+        });
+        let json = serde_json::to_string(&cache_info)?;
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Body::from(json))
+            .unwrap())
+    } else {
+        Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from(format!("Server on port {} not found", port)))
+            .unwrap())
+    }
+}
+
+async fn handle_clear_kv_cache(
+    req: Request<Body>,
+    state: Arc<RwLock<SimulatorState>>,
+) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
+    let body = hyper::body::to_bytes(req.into_body()).await?;
+
+    #[derive(serde::Deserialize)]
+    struct ClearKvCacheRequest {
+        port: PortSelector,
+    }
+
+    let request: ClearKvCacheRequest = serde_json::from_slice(&body)?;
+
+    let mut state = state.write().await;
+
+    match request.port {
+        PortSelector::Single(port) => {
+            if let Some(server) = state.servers.get_mut(&port) {
+                server.kv_cache_tokens.clear();
+            } else {
+                return Ok(Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::from(format!("Server on port {} not found", port)))
+                    .unwrap());
+            }
+        }
+        PortSelector::All(_) => {
+            for server in state.servers.values_mut() {
+                server.kv_cache_tokens.clear();
+            }
+        }
+    }
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"status":"ok"}"#))
+        .unwrap())
 }

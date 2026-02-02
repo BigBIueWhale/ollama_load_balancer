@@ -19,6 +19,7 @@ use crate::types::{
     OllamaTagsResponse, OllamaModelEntry, OllamaModelDetails,
     OllamaPsResponse, OllamaPsEntry, OllamaChatRequest, OllamaChatResponse,
     OllamaChatMessage, OllamaVersionResponse, OllamaErrorResponse,
+    calculate_prompt_eval, PromptEvalResult,
 };
 
 /// Global state for all simulated servers
@@ -461,9 +462,52 @@ async fn handle_chat(
             }
         }
 
-        ServerBehavior::Normal { tokens_per_sec, num_tokens, load_delay_ms } => {
+        ServerBehavior::Normal { tokens_per_sec, prompt_eval_tokens_per_sec, num_tokens, load_delay_ms } => {
+            // Calculate prompt eval with KV cache consideration
+            let prompt_eval_result = {
+                let state_guard = state.read().await;
+                if let Some(server) = state_guard.servers.get(&port) {
+                    calculate_prompt_eval(
+                        &chat_req.messages,
+                        &server.kv_cache_tokens,
+                        prompt_eval_tokens_per_sec,
+                    )
+                } else {
+                    // Fallback: no cache
+                    calculate_prompt_eval(&chat_req.messages, &[], prompt_eval_tokens_per_sec)
+                }
+            };
+
+            // Update KV cache with prompt tokens + response tokens (pre-compute for simulation)
+            {
+                let mut state_guard = state.write().await;
+                if let Some(server) = state_guard.servers.get_mut(&port) {
+                    // Cache = prompt tokens + simulated response tokens
+                    let mut new_cache = prompt_eval_result.prompt_tokens.clone();
+                    // Add assistant role marker and response tokens
+                    new_cache.push("<|assistant|>".to_string());
+                    let response_words = vec![
+                        "Hello", "!", " I", "'m", " a", " helpful", " AI", " assistant", ".",
+                        " How", " can", " I", " help", " you", " today", "?",
+                    ];
+                    for i in 0..num_tokens {
+                        new_cache.push(response_words[i % response_words.len()].to_string());
+                    }
+                    server.kv_cache_tokens = new_cache;
+                }
+            }
+
+            // Total delay = load delay (if cold) + prompt eval delay
+            let total_initial_delay_ms = load_delay_ms + prompt_eval_result.prompt_eval_delay_ms;
+
             if stream {
-                let chunks = generate_streaming_chunks(&model_name, num_tokens, tokens_per_sec, load_delay_ms);
+                let chunks = generate_streaming_chunks_with_stats(
+                    &model_name,
+                    num_tokens,
+                    tokens_per_sec,
+                    total_initial_delay_ms,
+                    prompt_eval_result,
+                );
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header("Content-Type", "application/x-ndjson")
@@ -471,9 +515,9 @@ async fn handle_chat(
                     .body(Body::wrap_stream(chunks))
                     .unwrap());
             } else {
-                // Simulate load delay
-                if load_delay_ms > 0 {
-                    sleep(Duration::from_millis(load_delay_ms)).await;
+                // Simulate delays
+                if total_initial_delay_ms > 0 {
+                    sleep(Duration::from_millis(total_initial_delay_ms)).await;
                 }
                 let response = generate_non_streaming_response(&model_name, num_tokens);
                 let json = serde_json::to_string(&response).unwrap();
@@ -564,9 +608,9 @@ async fn handle_generate(
     let stream = gen_req.stream.unwrap_or(true);
     let model_name = gen_req.model;
 
-    // Use similar logic as chat
+    // Use similar logic as chat (simplified - no KV cache for /api/generate)
     match behavior {
-        ServerBehavior::Normal { tokens_per_sec, num_tokens, load_delay_ms } => {
+        ServerBehavior::Normal { tokens_per_sec, num_tokens, load_delay_ms, .. } => {
             if stream {
                 let chunks = generate_streaming_chunks(&model_name, num_tokens, tokens_per_sec, load_delay_ms);
                 return Ok(Response::builder()
@@ -743,12 +787,30 @@ async fn handle_v1_chat_completions(
     }
 }
 
-/// Generate streaming response chunks for /api/chat
+/// Generate streaming response chunks for /api/chat (legacy, for Slow behavior)
 fn generate_streaming_chunks(
     model: &str,
     num_tokens: usize,
     tokens_per_sec: f64,
     load_delay_ms: u64,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
+    // Delegate to new function with dummy prompt eval
+    let prompt_eval = PromptEvalResult {
+        prompt_tokens: vec![],
+        cached_token_count: 0,
+        new_token_count: 10,
+        prompt_eval_delay_ms: 0,
+    };
+    generate_streaming_chunks_with_stats(model, num_tokens, tokens_per_sec, load_delay_ms, prompt_eval)
+}
+
+/// Generate streaming response chunks with accurate prompt eval stats
+fn generate_streaming_chunks_with_stats(
+    model: &str,
+    num_tokens: usize,
+    tokens_per_sec: f64,
+    initial_delay_ms: u64,
+    prompt_eval: PromptEvalResult,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     let model = model.to_string();
     let interval_ms = (1000.0 / tokens_per_sec) as u64;
@@ -759,21 +821,29 @@ fn generate_streaming_chunks(
         " How", " can", " I", " help", " you", " today", "?",
     ];
 
+    // Capture prompt eval stats for final chunk
+    let prompt_eval_count = prompt_eval.prompt_tokens.len() as u32;
+    let prompt_eval_duration_ns = prompt_eval.prompt_eval_delay_ms * 1_000_000;
+    let cached_count = prompt_eval.cached_token_count;
+
     stream::unfold(
-        (0usize, load_delay_ms, model, words, false),
-        move |(i, remaining_load_delay, model, words, done_sent)| async move {
+        (0usize, initial_delay_ms, model, words, false, prompt_eval_count, prompt_eval_duration_ns, cached_count),
+        move |(i, remaining_delay, model, words, done_sent, pe_count, pe_duration, cached)| async move {
             // If we already sent the final chunk, end the stream
             if done_sent {
                 return None;
             }
 
-            // Simulate load delay on first chunk
-            if remaining_load_delay > 0 {
-                sleep(Duration::from_millis(remaining_load_delay)).await;
+            // Simulate initial delay (load + prompt eval) on first chunk
+            if remaining_delay > 0 {
+                sleep(Duration::from_millis(remaining_delay)).await;
             }
 
             if i >= num_tokens {
-                // Final chunk with stats
+                // Final chunk with accurate stats
+                let eval_duration_ns = (num_tokens as u64) * (interval_ms * 1_000_000);
+                let total_duration_ns = (initial_delay_ms * 1_000_000) + eval_duration_ns;
+
                 let response = OllamaChatResponse {
                     model: model.clone(),
                     created_at: Utc::now().to_rfc3339(),
@@ -783,17 +853,22 @@ fn generate_streaming_chunks(
                     },
                     done: true,
                     done_reason: Some("stop".to_string()),
-                    total_duration: Some((num_tokens as u64) * (interval_ms * 1_000_000)),
-                    load_duration: Some(load_delay_ms * 1_000_000),
-                    prompt_eval_count: Some(10),
-                    prompt_eval_duration: Some(20_000_000),
+                    total_duration: Some(total_duration_ns),
+                    load_duration: Some(0), // Load time included in prompt_eval for simplicity
+                    prompt_eval_count: Some(pe_count),
+                    prompt_eval_duration: Some(pe_duration),
                     eval_count: Some(num_tokens as u32),
-                    eval_duration: Some((num_tokens as u64) * (interval_ms * 1_000_000)),
+                    eval_duration: Some(eval_duration_ns),
                 };
+
+                // Log cache hit info if any tokens were cached
+                if cached > 0 {
+                    // In real Ollama this isn't logged, but useful for debugging tests
+                }
+
                 let json = serde_json::to_string(&response).unwrap();
                 let chunk = format!("{}\n", json);
-                // Mark done_sent as true to end the stream on next iteration
-                return Some((Ok(bytes::Bytes::from(chunk)), (i + 1, 0, model, words, true)));
+                return Some((Ok(bytes::Bytes::from(chunk)), (i + 1, 0, model, words, true, pe_count, pe_duration, cached)));
             }
 
             // Regular content chunk
@@ -818,7 +893,7 @@ fn generate_streaming_chunks(
             };
             let json = serde_json::to_string(&response).unwrap();
             let chunk = format!("{}\n", json);
-            Some((Ok(bytes::Bytes::from(chunk)), (i + 1, 0, model, words, false)))
+            Some((Ok(bytes::Bytes::from(chunk)), (i + 1, 0, model, words, false, pe_count, pe_duration, cached)))
         },
     )
 }

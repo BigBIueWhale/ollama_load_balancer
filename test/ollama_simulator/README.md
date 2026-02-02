@@ -100,7 +100,7 @@ curl -X POST http://127.0.0.1:11500/behavior \
 
 | Behavior | Description |
 |----------|-------------|
-| `Normal` | Normal operation with configurable token rate |
+| `Normal` | Normal operation with configurable generation/prompt eval rates |
 | `Hang` | Accept connection but never respond |
 | `FailMidStream` | Send partial response then fail |
 | `TimeoutAfterHeaders` | Send headers then hang |
@@ -125,6 +125,7 @@ The test suite validates:
 8. **No available servers** - Graceful handling when all servers fail
 9. **GET requests** - Non-POST endpoints (`/api/tags`, `/api/version`, `/`)
 10. **Streaming response** - NDJSON streaming with proper termination
+11. **KV cache prefix matching** - Cached prompts have faster TTFT
 
 ## Architecture
 
@@ -170,6 +171,61 @@ The simulator implements these Ollama API endpoints:
 - `GET /v1/models` - OpenAI-compatible models list
 - `POST /v1/chat/completions` - OpenAI-compatible chat
 
+## KV Cache Simulation
+
+Each simulated server maintains its own KV cache state, mimicking real Ollama behavior where cached prompt prefixes speed up subsequent requests.
+
+### Timing Model
+
+| Phase | Default Rate | Notes |
+|-------|-------------|-------|
+| Prompt eval (uncached) | 2900 tok/s | RTX 5090 with qwen3-32b |
+| Prompt eval (cached) | Instant | Prefix match from KV cache |
+| Token generation | 65 tok/s | Output token rate |
+
+### Prefix Matching
+
+When a request arrives, the simulator:
+1. Tokenizes the prompt (simple word/punctuation splitting)
+2. Compares with cached tokens from previous request
+3. Calculates delay only for uncached (new) tokens
+4. Updates cache with full context (prompt + response)
+
+### Control API
+
+```bash
+# View KV cache state for server on port 11501
+curl http://127.0.0.1:11500/kv-cache/11501
+
+# Clear KV cache for a specific server
+curl -X POST http://127.0.0.1:11500/kv-cache/clear \
+  -H "Content-Type: application/json" \
+  -d '{"port": 11501}'
+
+# Clear KV cache for all servers
+curl -X POST http://127.0.0.1:11500/kv-cache/clear \
+  -H "Content-Type: application/json" \
+  -d '{"port": {"all": true}}'
+```
+
+### Configuring Timing
+
+```bash
+# Set custom prompt eval and generation rates
+curl -X POST http://127.0.0.1:11500/behavior \
+  -H "Content-Type: application/json" \
+  -d '{
+    "port": 11501,
+    "behavior": {
+      "type": "Normal",
+      "tokens_per_sec": 65.0,
+      "prompt_eval_tokens_per_sec": 2900.0,
+      "num_tokens": 20,
+      "load_delay_ms": 0
+    }
+  }'
+```
+
 ## Per-Server Configuration
 
 Each simulated server maintains independent state, enabling heterogeneous cluster testing:
@@ -214,20 +270,39 @@ On Windows, process termination uses `child.kill()` instead of Unix SIGTERM, but
 
 The infrastructure supports future extensions for testing v1.0.4 features with [llm_server_windows](https://github.com/BigBIueWhale/llm_server_windows) compatibility.
 
-`llm_server_windows` exposes a KV Cache Control API on port **11435** (separate from Ollama on 11434):
+### Production vs Test Architecture
+
+In production, each physical server runs:
+- Ollama on port **11434**
+- llm_server_windows KV Cache API on port **11435**
+
+For testing on `127.0.0.1`, use offset ports per simulated server:
+
+| Server | Ollama Port | KV Cache API Port |
+|--------|-------------|-------------------|
+| Server A | 11501 | 11601 |
+| Server B | 11502 | 11602 |
+| Server C | 11503 | 11603 |
+
+This allows the load balancer to query both endpoints at the same "logical" server.
+
+### llm_server_windows API
+
+`llm_server_windows` exposes:
 
 | Endpoint | Method | Response |
 |----------|--------|----------|
 | `/health` | GET | `{"status": "healthy", "ollama_running": true, "kv_cache_type": "q8_0"}` |
 | `/set-kv-cache` | POST | `202 Accepted` (triggers Ollama restart, 5-15s downtime) |
 
-To simulate this in the test framework:
+### Implementation Plan
 
 | Extension | How to Add |
 |-----------|-----------|
-| KV cache control port | Add secondary HTTP listener on port 11435 per simulated server |
+| KV cache API ports | Add `--kv-api-ports 11601,11602,11603` CLI flag |
 | `/health` endpoint | Return `{"status": "healthy", "ollama_running": true, "kv_cache_type": "<config>"}` |
-| `/set-kv-cache` endpoint | Accept `{"type": "q8_0"}` or `{"type": "q16"}`, trigger simulated restart |
-| Restart simulation | Use `TimeoutAfterHeaders` behavior for 5-15s, then resume `Normal` |
+| `/set-kv-cache` endpoint | Accept `{"type": "q8_0"}` or `{"type": "q16"}`, update state, trigger restart |
+| Restart simulation | Set behavior to `TimeoutAfterHeaders` for 5-15s, then auto-resume `Normal` |
+| Load balancer config | `--server=http://127.0.0.1:11501 --kv-api=http://127.0.0.1:11601` |
 
-The per-server state model (`SimulatedServerState`) already supports independent configuration of models, loaded state, and behavior per server.
+The per-server state model (`SimulatedServerState`) already supports independent configuration of models, loaded state, KV cache, and behavior per server.

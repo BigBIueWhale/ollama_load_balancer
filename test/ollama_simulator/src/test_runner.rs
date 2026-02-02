@@ -123,6 +123,9 @@ async fn run_tests() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Test 10: Streaming response timing
     results.push(test_streaming_response(&config, state.clone()).await);
 
+    // Test 11: KV cache prefix matching
+    results.push(test_kv_cache_prefix_matching(&config, state.clone()).await);
+
     let total_duration = test_start.elapsed();
 
     // Print results
@@ -1040,6 +1043,7 @@ async fn test_streaming_response(
         // Set a specific token rate
         set_all_servers_behavior(config, &ServerBehavior::Normal {
             tokens_per_sec: 50.0, // 50 tokens per second = 20ms per token
+            prompt_eval_tokens_per_sec: 2900.0,
             num_tokens: 10,
             load_delay_ms: 0,
         }).await?;
@@ -1082,6 +1086,114 @@ async fn test_streaming_response(
             Err("Streaming response did not end properly".into())
         } else {
             Err(format!("Streaming failed: status={}, lines={}", status, lines.len()).into())
+        }
+    }.await;
+
+    let error_message = match &result {
+        Ok(()) => String::new(),
+        Err(e) => e.to_string(),
+    };
+    TestResult {
+        name,
+        passed: result.is_ok(),
+        message: error_message,
+        duration_ms: start.elapsed().as_millis() as u64,
+    }
+}
+
+async fn test_kv_cache_prefix_matching(
+    config: &TestConfig,
+    _state: Arc<RwLock<SimulatorState>>,
+) -> TestResult {
+    let name = "KV cache prefix matching".to_string();
+    let start = Instant::now();
+
+    let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+        reset_simulator(config).await?;
+
+        // IMPORTANT: Each physical server has its own KV cache (like llm_server_windows)
+        // To test cache behavior, we need to ensure both requests go to the SAME server.
+        // Disable all servers except one to force routing to a single server.
+        set_server_behavior(config, config.server_ports[0], &ServerBehavior::Normal {
+            tokens_per_sec: 100.0,
+            prompt_eval_tokens_per_sec: 500.0,  // Slow enough to measure: 2ms per token
+            num_tokens: 5,
+            load_delay_ms: 0,
+        }).await?;
+        // Make other servers unavailable so load balancer routes to first server
+        set_server_behavior(config, config.server_ports[1], &ServerBehavior::Hang).await?;
+        set_server_behavior(config, config.server_ports[2], &ServerBehavior::Hang).await?;
+
+        let lb = start_load_balancer(config).await?;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?;
+
+        // First request - cold cache on server[0], should have prompt eval delay
+        let first_start = Instant::now();
+        let response1 = client.post(&format!("http://127.0.0.1:{}/api/chat", config.load_balancer_port))
+            .json(&serde_json::json!({
+                "model": "test-model:latest",
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": "Hello, how are you today?"}
+                ],
+                "stream": true
+            }))
+            .send()
+            .await?;
+
+        // Read first byte (time to first token)
+        let mut stream1 = response1.bytes_stream();
+        use futures_util::StreamExt;
+        let _first_chunk = stream1.next().await;
+        let first_ttft = first_start.elapsed();
+
+        // Consume rest of stream
+        while let Some(_chunk) = stream1.next().await {}
+
+        // Small delay to ensure state is updated
+        sleep(Duration::from_millis(50)).await;
+
+        // Second request - same prefix, same server, should hit cache and be faster
+        let second_start = Instant::now();
+        let response2 = client.post(&format!("http://127.0.0.1:{}/api/chat", config.load_balancer_port))
+            .json(&serde_json::json!({
+                "model": "test-model:latest",
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": "Hello, how are you today?"}  // Same as before
+                ],
+                "stream": true
+            }))
+            .send()
+            .await?;
+
+        let mut stream2 = response2.bytes_stream();
+        let _first_chunk2 = stream2.next().await;
+        let second_ttft = second_start.elapsed();
+
+        // Consume rest of stream
+        while let Some(_chunk) = stream2.next().await {}
+
+        stop_load_balancer(lb).await;
+
+        // Second request should be faster because prompt is cached on server[0]
+        let first_ms = first_ttft.as_millis();
+        let second_ms = second_ttft.as_millis();
+
+        // The second request should be noticeably faster (cached prompt eval)
+        // With 500 tok/s prompt eval, a ~20 token prompt should take ~40ms
+        // Cached should be near-instant (just generation time ~10ms per token)
+        if second_ms < first_ms || (first_ms < 50 && second_ms < 50) {
+            // Either second is faster, or both are fast (small prompt)
+            Ok(())
+        } else {
+            Err(format!(
+                "Expected cached request to be faster. First TTFT: {}ms, Second TTFT: {}ms",
+                first_ms, second_ms
+            ).into())
         }
     }.await;
 

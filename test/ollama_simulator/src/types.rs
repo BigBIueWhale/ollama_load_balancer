@@ -12,9 +12,12 @@ use std::collections::HashMap;
 pub enum ServerBehavior {
     /// Server operates normally, streaming responses with realistic timing
     Normal {
-        /// Tokens per second for generation (default: ~70)
+        /// Tokens per second for generation (default: 65 for qwen3-32b class models)
         #[serde(default = "default_tokens_per_sec")]
         tokens_per_sec: f64,
+        /// Tokens per second for prompt evaluation (default: 2900 for RTX 5090)
+        #[serde(default = "default_prompt_eval_tokens_per_sec")]
+        prompt_eval_tokens_per_sec: f64,
         /// Number of tokens to generate before stopping
         #[serde(default = "default_num_tokens")]
         num_tokens: usize,
@@ -87,7 +90,11 @@ pub enum ServerBehavior {
 }
 
 fn default_tokens_per_sec() -> f64 {
-    70.0
+    65.0  // ~65 tok/s generation for qwen3-32b class models
+}
+
+fn default_prompt_eval_tokens_per_sec() -> f64 {
+    2900.0  // ~2900 tok/s prompt ingestion on RTX 5090
 }
 
 fn default_num_tokens() -> usize {
@@ -102,6 +109,7 @@ impl Default for ServerBehavior {
     fn default() -> Self {
         ServerBehavior::Normal {
             tokens_per_sec: default_tokens_per_sec(),
+            prompt_eval_tokens_per_sec: default_prompt_eval_tokens_per_sec(),
             num_tokens: default_num_tokens(),
             load_delay_ms: 0,
         }
@@ -126,6 +134,9 @@ pub struct SimulatedServerState {
     pub request_count: u64,
     /// Active requests (for tracking cancellation)
     pub active_requests: HashMap<String, ActiveRequest>,
+    /// KV cache: tokens currently cached (prompt + previous response)
+    /// Used for prefix matching - if incoming prompt shares prefix, those tokens are "free"
+    pub kv_cache_tokens: Vec<String>,
 }
 
 impl SimulatedServerState {
@@ -138,7 +149,14 @@ impl SimulatedServerState {
             loaded_model: None,
             request_count: 0,
             active_requests: HashMap::new(),
+            kv_cache_tokens: Vec::new(),
         }
+    }
+
+    /// Clear the KV cache (e.g., when model is unloaded or switched)
+    #[allow(dead_code)]
+    pub fn clear_kv_cache(&mut self) {
+        self.kv_cache_tokens.clear();
     }
 }
 
@@ -358,4 +376,91 @@ pub struct TestResult {
     pub passed: bool,
     pub message: String,
     pub duration_ms: u64,
+}
+
+/// Result of prompt evaluation with KV cache consideration
+#[derive(Debug, Clone)]
+pub struct PromptEvalResult {
+    /// All tokens from the prompt (for caching after response)
+    pub prompt_tokens: Vec<String>,
+    /// Number of tokens that were already cached (prefix match)
+    pub cached_token_count: usize,
+    /// Number of new tokens that need processing
+    #[allow(dead_code)]
+    pub new_token_count: usize,
+    /// Calculated delay in milliseconds for processing new tokens
+    pub prompt_eval_delay_ms: u64,
+}
+
+/// Simple tokenizer for simulation purposes
+/// Splits on whitespace and punctuation, roughly approximating subword tokenization
+pub fn simple_tokenize(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(current.clone());
+                current.clear();
+            }
+            // Include space as separate token (like real tokenizers often do)
+            if c == ' ' {
+                tokens.push(" ".to_string());
+            }
+        } else if c.is_ascii_punctuation() {
+            if !current.is_empty() {
+                tokens.push(current.clone());
+                current.clear();
+            }
+            tokens.push(c.to_string());
+        } else {
+            current.push(c);
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+/// Calculate prompt eval timing based on KV cache state
+pub fn calculate_prompt_eval(
+    messages: &[OllamaChatMessage],
+    cached_tokens: &[String],
+    prompt_eval_tokens_per_sec: f64,
+) -> PromptEvalResult {
+    // Tokenize all messages into a single token stream
+    let mut prompt_tokens = Vec::new();
+    for msg in messages {
+        // Add role marker
+        prompt_tokens.push(format!("<|{}|>", msg.role));
+        // Add content tokens
+        prompt_tokens.extend(simple_tokenize(&msg.content));
+    }
+
+    // Find prefix match with cache
+    let cached_token_count = prompt_tokens
+        .iter()
+        .zip(cached_tokens.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let new_token_count = prompt_tokens.len().saturating_sub(cached_token_count);
+
+    // Calculate delay: new tokens / tokens_per_sec * 1000ms
+    let prompt_eval_delay_ms = if prompt_eval_tokens_per_sec > 0.0 {
+        ((new_token_count as f64 / prompt_eval_tokens_per_sec) * 1000.0) as u64
+    } else {
+        0
+    };
+
+    PromptEvalResult {
+        prompt_tokens,
+        cached_token_count,
+        new_token_count,
+        prompt_eval_delay_ms,
+    }
 }
